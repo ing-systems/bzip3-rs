@@ -10,7 +10,7 @@ readme = "README.md"
 authors = ["Karol Harasim <karol.harasim@gmail.com>"]
 keywords = ["bzip3", "compression", "decompression", "bwt", "archive"]
 categories = ["compression", "command-line-utilities"]
-exclude = [".github/", "AGENTS.md", "packaging/"]
+exclude = [".github/", "AGENTS.md", "packaging/", "tests/vectors/"]
 
 [lib]
 name = "bzip3_rs"

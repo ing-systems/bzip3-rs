@@ -1,0 +1,14 @@
+# Oracle vectors must keep LF bytes on all OS. Without this,
+# Windows checkouts convert text-like vectors (e.g. text2k.bin)
+# from LF to CRLF and byte-for-byte oracle tests fail.
+tests/vectors/**/*.bin binary
+tests/vectors/**/*.cm binary
+tests/vectors/**/*.bz3 binary
+tests/vectors/**/*.bwt binary
+tests/vectors/**/*.enc binary
+tests/vectors/**/*.in binary
+tests/vectors/**/*.input binary
+tests/vectors/**/*.original binary
+tests/vectors/**/*.bad binary
+tests/vectors/**/*.expected text eol=lf
+tests/vectors/**/*.index text eol=lf

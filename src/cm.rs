@@ -407,10 +407,11 @@ mod tests {
     use super::CmCoder;
     use crate::error::Error;
 
-    /// One oracle pair: raw input bytes and reference coded bytes.
+    /// One oracle pair: name, raw input bytes, and reference coded bytes.
     macro_rules! vector {
         ($name:literal) => {
             (
+                $name,
                 include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/tests/vectors/cm/",
@@ -427,8 +428,8 @@ mod tests {
         };
     }
 
-    /// All oracle vectors: `(raw, coded)` pairs.
-    const VECTORS: &[(&[u8], &[u8])] = &[
+    /// All oracle vectors: `(name, raw, coded)` triples.
+    const VECTORS: &[(&str, &[u8], &[u8])] = &[
         vector!("empty"),
         vector!("zero1"),
         vector!("ff1"),
@@ -473,16 +474,17 @@ mod tests {
 
     #[test]
     fn encode_matches_oracle_byte_for_byte() {
-        for (raw, coded) in VECTORS {
-            assert_eq!(encode_all(raw), coded.to_vec(), "encode differs");
+        for (name, raw, coded) in VECTORS {
+            assert_eq!(encode_all(raw), coded.to_vec(), "encode differs for {name}");
         }
     }
 
     #[test]
     fn decode_restores_oracle_originals() {
-        for (raw, coded) in VECTORS {
-            let got = decode_all(coded, raw.len()).expect("oracle stream decodes");
-            assert_eq!(got, raw.to_vec(), "decode differs");
+        for (name, raw, coded) in VECTORS {
+            let got = decode_all(coded, raw.len())
+                .unwrap_or_else(|_| panic!("oracle stream decodes for {name}"));
+            assert_eq!(got, raw.to_vec(), "decode differs for {name}");
         }
     }
 
@@ -511,7 +513,7 @@ mod tests {
 
     #[test]
     fn every_truncation_fails_with_truncated_data() {
-        for (index, (raw, coded)) in VECTORS.iter().enumerate() {
+        for (name, raw, coded) in VECTORS {
             // Empty output decodes vacuously; see
             // `empty_output_needs_no_input`.
             if raw.is_empty() {
@@ -522,10 +524,10 @@ mod tests {
                 let mut out = vec![0; raw.len()];
                 let err = state
                     .decode(&coded[..end], 0, &mut out)
-                    .expect_err(&format!("short stream of vector {index} must fail"));
+                    .expect_err(&format!("short stream of vector {name} must fail"));
                 assert!(
                     matches!(err, Error::TruncatedData),
-                    "wrong error for short stream"
+                    "wrong error for short stream of {name}"
                 );
             }
         }
@@ -535,7 +537,7 @@ mod tests {
     fn empty_output_needs_no_input() {
         let mut state = CmCoder::new();
         state.decode(&[], 0, &mut []).expect("empty decode is free");
-        let (_, coded) = VECTORS[4];
+        let (_, _, coded) = VECTORS[4];
         state
             .decode(&coded[..3.min(coded.len())], 0, &mut [])
             .expect("empty output ignores input");
@@ -543,11 +545,12 @@ mod tests {
 
     #[test]
     fn trailing_bytes_are_ignored() {
-        for (raw, coded) in VECTORS {
+        for (name, raw, coded) in VECTORS {
             let mut padded = coded.to_vec();
             padded.extend_from_slice(&[0xAA, 0x55, 0x00, 0xFF]);
-            let got = decode_all(&padded, raw.len()).expect("padded stream decodes");
-            assert_eq!(got, raw.to_vec(), "padded decode differs");
+            let got = decode_all(&padded, raw.len())
+                .unwrap_or_else(|_| panic!("padded stream decodes for {name}"));
+            assert_eq!(got, raw.to_vec(), "padded decode differs for {name}");
         }
     }
 

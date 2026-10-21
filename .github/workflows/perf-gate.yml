@@ -1,0 +1,47 @@
+name: perf-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  ORACLE_REPO: https://github.com/iczelia/bzip3
+  ORACLE_PIN: fd3d71f83f129d326a06ecdb37abde5a48b69f25
+
+jobs:
+  bench-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential python3
+
+      - name: Compile benches
+        run: cargo bench --no-run
+
+      - name: Prove the harness runs
+        run: cargo bench --bench stages -- cm/encode-random --sample-size 10 --measurement-time 2
+
+      - name: Build the pinned oracle
+        run: |
+          git clone "$ORACLE_REPO" /tmp/bzip3-oracle
+          git -C /tmp/bzip3-oracle checkout "$ORACLE_PIN"
+          cmake -S /tmp/bzip3-oracle -B /tmp/bzip3-oracle/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/bzip3-oracle/build --config Release
+
+      - name: Build our release CLI
+        run: cargo build --release --features cli
+
+      - name: Run the oracle throughput gate
+        run: >
+          python3 .github/workflows/compare_gate.py
+          --ours "$GITHUB_WORKSPACE/target/release/bzip3"
+          --oracle-bin /tmp/bzip3-oracle/build/bzip3
+          --repo "$GITHUB_WORKSPACE"
+          --work /tmp/perf-gate-work

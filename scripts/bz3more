@@ -1,0 +1,79 @@
+#!/bin/sh
+# Copyright (C) 2026 The bzip3-rs contributors.
+# License: GNU Lesser GPL version 3 <https://www.gnu.org/licenses/lgpl-3.0.en.html>
+# bz3more: page possibly compressed files.
+# Written from scratch for bzip3-rs. Mirrors the behavior of the
+# bzip2 bzmore wrapper with .bz2 replaced by .bz3.
+
+PATH="$PATH:/usr/bin:/bin"; export PATH
+
+# Write the plain form of "$1" to stdout.
+# Uses bzip3 when the file starts with the BZ3v1 magic.
+# Uses cat for all other files.
+plain() {
+	f="$1"
+	if [ "$(head -c 5 -- "$f" 2>/dev/null)" = "BZ3v1" ]; then
+		bzip3 -dcfq -- "$f"
+	else
+		cat -- "$f"
+	fi
+}
+
+prog=`echo "$0" | sed 's|.*/||'`
+case "$prog" in
+	*less)	more=less	;;
+	*most)	more=most	;;
+	*)	more=more	;;
+esac
+
+if test "`echo -n a`" = "-n a"; then
+	n1=''; n2='\c'
+else
+	n1='-n'; n2=''
+fi
+oldtty=`stty -g 2>/dev/null`
+if stty -cbreak 2>/dev/null; then
+	cb='cbreak'; ncb='-cbreak'
+else
+	cb='min 1 -icanon'; ncb='icanon eof ^d'
+fi
+if test $? -eq 0 -a -n "$oldtty"; then
+	trap 'stty $oldtty 2>/dev/null; exit' 0 2 3 5 10 13 15
+else
+	trap 'stty $ncb echo 2>/dev/null; exit' 0 2 3 5 10 13 15
+fi
+
+if test $# = 0; then
+	if test -t 0; then
+		echo "usage: $prog files..."
+	else
+		tmp=`mktemp "${TMPDIR:-/tmp}"/bz3more.XXXXXXXXXX` || exit 1
+		cat > "$tmp"
+		plain "$tmp" | eval "$more"
+		r=$?
+		rm -f "$tmp"
+		exit $r
+	fi
+else
+	FIRST=1
+	for FILE
+	do
+		if test $FIRST -eq 0; then
+			echo $n1 "--More--(Next file: $FILE)$n2"
+			stty $cb -echo 2>/dev/null
+			ANS=`dd bs=1 count=1 2>/dev/null`
+			stty $ncb echo 2>/dev/null
+			echo " "
+			if test "$ANS" = 'e' -o "$ANS" = 'q'; then
+				exit
+			fi
+		fi
+		if test "$ANS" != 's'; then
+			echo "------> $FILE <------"
+			plain "$FILE" | eval "$more"
+		fi
+		if test -t; then
+			FIRST=0
+		fi
+	done
+fi

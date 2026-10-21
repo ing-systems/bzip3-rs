@@ -1,0 +1,105 @@
+.TH BUNZIP3 1 "2026-10-21" "bzip3-rs" "User Commands"
+.SH NAME
+bunzip3 \- decompress bzip3 files
+.SH SYNOPSIS
+.B bunzip3
+.RB [ \-e / \-z / \-d / \-t / \-r ]
+.RB [ \-c ]
+.RB [ \-f ]
+.RB [ \-k ]
+.RB [ \-q ]
+.RB [ \-v ]
+.RB [ \-j
+.IR N ]
+.RB [ \-B ]
+.RI [ files... ]
+.SH DESCRIPTION
+.B bunzip3
+is
+.B bzip3
+with decode defaults: it behaves as
+.B "bzip3 \-d"
+unless explicit mode flags override it.
+Every positional is an independent input; there is no
+.I "in out"
+form. With no files, standard input is processed to standard
+output.
+.B \-B
+is accepted for compatibility and ignored.
+.PP
+Decode strips one trailing
+.B .bz3
+(case-sensitive); any other name decodes to
+.IB name .out
+with a
+.I "Can't guess original name"
+notice, suppressed by
+.BR \-q .
+.PP
+A successful file-to-file run deletes the input unless
+.B \-k
+is given.
+.BR \-c ,
+.B \-t ,
+.B \-r
+and standard-input runs never delete; failures never delete.
+The output inherits the input mode and modification time.
+A failed run removes its partial output, except in recover mode.
+.PP
+.B \-\-rm
+is rejected as an unknown flag.
+.B \-f
+only permits overwriting outputs; it never passes non-bzip3
+bytes through. Terminal refusal applies as in
+.BR bzip3 .
+.SH OPTIONS
+.TP
+.BR \-r ", " \-\-recover
+Recover damaged input. A block with a checksum fault keeps its decoded
+bytes, and any other damaged block gives zero bytes. The tool never
+deletes the input file and keeps its output after a failure.
+See
+.BR bzip3 (1).
+.TP
+.BR \-c ", " \-\-stdout
+Write to standard output.
+.TP
+.BR \-f ", " \-\-force
+Overwrite an existing output file.
+.TP
+.BR \-k ", " \-\-keep
+Keep (do not delete) input files on success.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress non-critical warnings only; errors always print.
+.TP
+.BR \-v ", " \-\-verbose
+Print byte counts and ratios to standard error.
+.TP
+.BR \-j " " \fIN\fR ", " \-\-jobs=\fIN\fR
+Worker thread count, 0 to 64. 0 (default) uses all available cores,
+clamped to 64. 1 runs serially; 2 to 64 select that many workers.
+.TP
+.BR \-B ", " \-\-batch
+Accepted and ignored.
+.SH EXIT STATUS
+.TP
+.B 0
+Success, help, or version.
+.TP
+.B 1
+Bad flags, unreadable or missing input, existing output without
+.BR \-f ,
+terminal refusal, or allocation failure. With several files the
+worst per-file code is returned.
+.TP
+.B 2
+Corrupt data: bad magic, truncated input, bad header size,
+inconsistent headers, block or CRC failure, or a trailing byte.
+Recover mode also returns 2 when it found a damaged block or stopped early.
+.SH SEE ALSO
+.BR bzip3 (1),
+.BR bz3cat (1),
+.BR bz3grep (1),
+.BR bz3diff (1),
+.BR bz3more (1)

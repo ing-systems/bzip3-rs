@@ -1,0 +1,46 @@
+.TH BZ3DIFF 1 "2026-10-20" "bzip3-rs" "User Commands"
+.SH NAME
+bz3diff, bz3cmp \- compare possibly compressed files
+.SH SYNOPSIS
+.B bz3diff
+.RI [ diff_options ]
+.I file
+.RI [ file ]
+.br
+.B bz3cmp
+.RI [ cmp_options ]
+.I file
+.RI [ file ]
+.SH DESCRIPTION
+.B bz3diff
+compares files with
+.BR diff ,
+and
+.B bz3cmp
+compares them with
+.BR cmp .
+Options are passed through to the comparison tool.
+A file starting with the
+.B BZ3v1
+magic is decompressed with
+.B "bzip3 \-dcfq"
+; any other file is read directly.
+.PP
+With one file, the plain form of
+.I file.bz3
+is compared against
+.IR file .
+With two files, each side is decompressed as needed and fed to the
+tool. Two plain files are compared directly.
+Missing files report
+.I "not found or not a regular file"
+and exit 1.
+.SH EXIT STATUS
+The exit status is that of the comparison tool: 0 for equal files,
+1 for differing files, 2 on error.
+.SH SEE ALSO
+.BR bzip3 (1),
+.BR diff (1),
+.BR cmp (1),
+.BR bz3grep (1),
+.BR bz3more (1)

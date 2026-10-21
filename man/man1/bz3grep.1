@@ -1,0 +1,70 @@
+.TH BZ3GREP 1 "2026-10-20" "bzip3-rs" "User Commands"
+.SH NAME
+bz3grep, bz3egrep, bz3fgrep \- search possibly compressed files for a pattern
+.SH SYNOPSIS
+.B bz3grep
+.RI [ grep_options ]
+.I pattern
+.RI [ files... ]
+.br
+.B bz3egrep
+.RI [ grep_options ]
+.I pattern
+.RI [ files... ]
+.br
+.B bz3fgrep
+.RI [ grep_options ]
+.I pattern
+.RI [ files... ]
+.SH DESCRIPTION
+.B bz3grep
+searches the plain form of each named file for
+.IR pattern .
+A file starting with the
+.B BZ3v1
+magic is decompressed with
+.B "bzip3 \-dcfq"
+; any other file is read directly.
+A bare name
+.I foo
+also matches
+.IR foo.bz3 ,
+as with the bzip2 wrapper.
+.PP
+The program name selects the search tool:
+.B bz3egrep
+uses
+.BR egrep ,
+.B bz3fgrep
+uses
+.BR fgrep ,
+and
+.B bz3grep
+uses
+.BR grep
+(or the
+.BR $GREP ,
+.BR $EGREP ,
+.BR $FGREP
+overrides).
+.BR \-e ,
+.BR \-f ,
+.BR \-A ,
+and
+.B \-B
+are forwarded to the search tool.
+With no files, standard input is probed for the magic and searched.
+.PP
+With several files, each match is prefixed with the file name.
+.B \-h
+suppresses the prefix;
+.B \-l
+lists matching file names only.
+.SH EXIT STATUS
+The exit status is that of the search tool: 0 on match, 1 on no
+match, and 2 on error. The status of the last failing file is kept.
+.SH SEE ALSO
+.BR bzip3 (1),
+.BR grep (1),
+.BR bz3diff (1),
+.BR bz3more (1)

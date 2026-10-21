@@ -1,0 +1,9 @@
+/target/
+# makepkg staging and VCS cache (per packaging dir).
+/packaging/archlinux/pkg/
+/packaging/archlinux/src/
+/packaging/archlinux/bzip3-rs/
+# Local agent work (issue tracker, research notes). Keep out of history.
+/.scratch/
+*.pkg.tar*
+*.src.tar*

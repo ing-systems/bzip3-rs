@@ -1,0 +1,116 @@
+#!/bin/sh
+# Copyright (C) 2026 The bzip3-rs contributors.
+# License: GNU Lesser GPL version 3 <https://www.gnu.org/licenses/lgpl-3.0.en.html>
+# bz3grep: search possibly compressed files for a pattern.
+# Written from scratch for bzip3-rs. Mirrors the behavior of the
+# bzip2 bzgrep wrapper with .bz2 replaced by .bz3.
+
+PATH="$PATH:/usr/bin:/bin"; export PATH
+
+# Write the plain form of "$1" to stdout.
+# Uses bzip3 when the file starts with the BZ3v1 magic.
+# Uses cat for all other files.
+plain() {
+	f="$1"
+	if [ "$(head -c 5 -- "$f" 2>/dev/null)" = "BZ3v1" ]; then
+		bzip3 -dcfq -- "$f"
+	else
+		cat -- "$f"
+	fi
+}
+
+prog=`echo "$0" | sed 's|.*/||'`
+case "$prog" in
+	*egrep)	grep=${EGREP-egrep}	;;
+	*fgrep)	grep=${FGREP-fgrep}	;;
+	*)	grep=${GREP-grep}	;;
+esac
+
+pat=""
+opt=""
+while test $# -ne 0; do
+	case "$1" in
+	-e | -f)
+		opt="$opt $1"
+		shift
+		pat="$1"
+		if test "$grep" = grep; then
+			grep=egrep
+		fi
+		;;
+	-A | -B)
+		opt="$opt $1 $2"
+		shift
+		;;
+	-*)
+		opt="$opt $1"
+		;;
+	*)
+		if test -z "$pat"; then
+			pat="$1"
+		else
+			break
+		fi
+		;;
+	esac
+	shift
+done
+
+if test -z "$pat"; then
+	echo "grep through bzip3 files"
+	echo "usage: $prog [grep_options] pattern [files]"
+	exit 1
+fi
+
+list=0
+silent=0
+op=`echo "$opt" | sed -e 's/ //g' -e 's/-//g'`
+case "$op" in
+	*l*)	list=1
+		;;
+esac
+case "$op" in
+	*h*)	silent=1
+		;;
+esac
+
+if test $# -eq 0; then
+	tmp=`mktemp "${TMPDIR:-/tmp}"/bz3grep.XXXXXXXXXX` || exit 1
+	cat > "$tmp"
+	plain "$tmp" | $grep $opt "$pat"
+	r=$?
+	rm -f "$tmp"
+	exit $r
+fi
+
+res=0
+for i do
+	if test -f "$i"; then
+		:
+	else
+		if test -f "$i.bz3"; then
+			i="$i.bz3"
+		fi
+	fi
+	if test $list -eq 1; then
+		plain "$i" | $grep $opt "$pat" 2>&1 > /dev/null && echo "$i"
+		r=$?
+	elif test $# -eq 1 -o $silent -eq 1; then
+		plain "$i" | $grep $opt "$pat"
+		r=$?
+	else
+		j=$(echo "$i" | sed 's/\\/&&/g;s/|/\\&/g;s/&/\\&/g')
+		j=`printf "%s" "$j" | tr '\n' ' '`
+		exec 3>&1
+		eval `
+			exec 4>&1 >&3 3>&-
+			{
+				plain "$i" 4>&-
+			} | {
+				$grep $opt "$pat" 4>&-; echo "r=$?;" >&4
+			} | sed "s|^|${j}:|"
+		`
+	fi
+	test "$r" -ne 0 && res="$r"
+done
+exit $res

@@ -1,0 +1,114 @@
+[package]
+name = "bzip3-rs"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "LGPL-3.0-only AND Apache-2.0"
+description = "Pure-Rust port of the bzip3 compressor (no C FFI)"
+repository = "https://github.com/ing-systems/bzip3-rs"
+readme = "README.md"
+authors = ["Karol Harasim <karol.harasim@gmail.com>"]
+keywords = ["bzip3", "compression", "decompression", "bwt", "archive"]
+categories = ["compression", "command-line-utilities"]
+exclude = [".github/", "AGENTS.md", "packaging/"]
+
+[lib]
+name = "bzip3_rs"
+path = "src/lib.rs"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+
+[dependencies]
+clap = { version = "4.5", optional = true, features = ["derive"] }
+num_cpus = "1.17"
+rayon = "1"
+
+[features]
+default = []
+cli = ["dep:clap"]
+bench-internals = []
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "end_to_end"
+harness = false
+
+[[bench]]
+name = "stages"
+harness = false
+
+[[bench]]
+name = "rle"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "sais"
+harness = false
+required-features = ["bench-internals"]
+
+[[bin]]
+name = "bzip3"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "dispatch"
+path = "tests/dispatch.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "scripts"
+path = "tests/scripts.rs"
+required-features = ["cli"]
+
+[package.metadata.deb]
+name = "bzip3-rs"
+section = "utils"
+priority = "optional"
+features = ["cli"]
+depends = "$auto"
+conflicts = "bzip3"
+replaces = "bzip3"
+provides = "bzip3"
+license-file = "packaging/debian/copyright"
+changelog = "packaging/debian/changelog"
+copyright = "2026, The bzip3-rs contributors"
+extended-description = """\
+Pure-Rust port of the bzip3 compressor. \
+The tool reads and writes the bzip3 format. \
+Output is compatible with C bzip3 in both directions. \
+This package replaces the C bzip3 package."""
+assets = [
+    ["target/release/bzip3", "usr/bin/", "755"],
+    ["scripts/bz3grep", "usr/bin/", "755"],
+    ["scripts/bz3more", "usr/bin/", "755"],
+    ["scripts/bz3diff", "usr/bin/", "755"],
+    ["man/man1/*.1", "usr/share/man/man1/", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/bzip3-rs/", "644"],
+    { dest = "usr/bin/bunzip3", link_name = "bzip3" },
+    { dest = "usr/bin/bz3cat", link_name = "bzip3" },
+    { dest = "usr/bin/bz3egrep", link_name = "bz3grep" },
+    { dest = "usr/bin/bz3fgrep", link_name = "bz3grep" },
+    { dest = "usr/bin/bz3less", link_name = "bz3more" },
+    { dest = "usr/bin/bz3most", link_name = "bz3more" },
+    { dest = "usr/bin/bz3cmp", link_name = "bz3diff" },
+    { dest = "usr/share/man/man1/bz3egrep.1.gz", link_name = "bz3grep.1.gz" },
+    { dest = "usr/share/man/man1/bz3fgrep.1.gz", link_name = "bz3grep.1.gz" },
+    { dest = "usr/share/man/man1/bz3less.1.gz", link_name = "bz3more.1.gz" },
+    { dest = "usr/share/man/man1/bz3most.1.gz", link_name = "bz3more.1.gz" },
+    { dest = "usr/share/man/man1/bz3cmp.1.gz", link_name = "bz3diff.1.gz" },
+]

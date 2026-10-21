@@ -1,0 +1,91 @@
+#!/bin/sh
+# Copyright (C) 2026 The bzip3-rs contributors.
+# License: GNU Lesser GPL version 3 <https://www.gnu.org/licenses/lgpl-3.0.en.html>
+# bz3diff: compare possibly compressed files with cmp or diff.
+# Written from scratch for bzip3-rs. Mirrors the behavior of the
+# bzip2 bzdiff wrapper with .bz2 replaced by .bz3.
+
+PATH="$PATH:/usr/bin:/bin"; export PATH
+
+# Write the plain form of "$1" to stdout.
+# Uses bzip3 when the file starts with the BZ3v1 magic.
+# Uses cat for all other files.
+plain() {
+	f="$1"
+	if [ "$(head -c 5 -- "$f" 2>/dev/null)" = "BZ3v1" ]; then
+		bzip3 -dcfq -- "$f"
+	else
+		cat -- "$f"
+	fi
+}
+
+prog=`echo "$0" | sed 's|.*/||'`
+case "$prog" in
+	*cmp)	comp=${CMP-cmp}	;;
+	*)	comp=${DIFF-diff}	;;
+esac
+
+OPTIONS=
+FILES=
+for ARG
+do
+	case "$ARG" in
+	-*)	OPTIONS="$OPTIONS $ARG"	;;
+	*)
+		if test -f "$ARG"; then
+			FILES="$FILES $ARG"
+		else
+			echo "${prog}: $ARG not found or not a regular file"
+			exit 1
+		fi
+		;;
+	esac
+done
+if test -z "$FILES"; then
+	echo "Usage: $prog [${comp}_options] file [file]"
+	exit 1
+fi
+set $FILES
+if test $# -eq 1; then
+	FILE=`echo "$1" | sed 's/.bz3$//'`
+	plain "$FILE.bz3" | $comp $OPTIONS - "$FILE"
+	STAT="$?"
+elif test $# -eq 2; then
+	case "$1" in
+	*.bz3)
+		case "$2" in
+		*.bz3)
+			F=`echo "$2" | sed 's|.*/||;s|.bz3$||'`
+			tmp=`mktemp "${TMPDIR:-/tmp}"/bz3diff.XXXXXXXXXX` || {
+				echo 'cannot create a temporary file' >&2
+				exit 1
+			}
+			plain "$2" > "$tmp"
+			plain "$1" | $comp $OPTIONS - "$tmp"
+			STAT="$?"
+			/bin/rm -f "$tmp"
+			;;
+		*)
+			plain "$1" | $comp $OPTIONS - "$2"
+			STAT="$?"
+			;;
+		esac
+		;;
+	*)
+		case "$2" in
+		*.bz3)
+			plain "$2" | $comp $OPTIONS "$1" -
+			STAT="$?"
+			;;
+		*)
+			$comp $OPTIONS "$1" "$2"
+			STAT="$?"
+			;;
+		esac
+		;;
+	esac
+else
+	echo "Usage: $prog [${comp}_options] file [file]"
+	exit 1
+fi
+exit "$STAT"

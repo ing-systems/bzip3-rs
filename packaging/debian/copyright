@@ -1,0 +1,15 @@
+bzip3-rs is a pure-Rust port of the bzip3 compressor.
+Source: https://github.com/ing-systems/bzip3-rs
+
+Copyright (C) 2026 The bzip3-rs contributors.
+
+This package uses two licenses: LGPL-3.0-only AND Apache-2.0.
+
+The package code is under the GNU Lesser General Public License, version 3.
+The full text is in /usr/share/common-licenses/LGPL-3 on a Debian system.
+
+The suffix-array code derives from libsais.
+libsais is under the Apache License, version 2.0.
+Copyright (C) 2021-2022 Ilya Grebnov.
+A stability patch is Copyright (C) 2022 Kamila Szewczyk, under the same license.
+The full text is in /usr/share/common-licenses/Apache-2.0 on a Debian system.

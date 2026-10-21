@@ -1,0 +1,57 @@
+.TH BZ3MORE 1 "2026-10-20" "bzip3-rs" "User Commands"
+.SH NAME
+bz3more, bz3less, bz3most \- page possibly compressed files
+.SH SYNOPSIS
+.B bz3more
+.RI [ files... ]
+.br
+.B bz3less
+.RI [ files... ]
+.br
+.B bz3most
+.RI [ files... ]
+.SH DESCRIPTION
+.B bz3more
+pages the plain form of each named file.
+A file starting with the
+.B BZ3v1
+magic is decompressed with
+.B "bzip3 \-dcfq"
+; any other file is read directly.
+With no files, standard input is probed for the magic and paged.
+.PP
+The program name selects the pager:
+.B bz3less
+uses
+.BR less ,
+.B bz3most
+uses
+.BR most ,
+and
+.B bz3more
+uses
+.BR more .
+Each file is announced with a
+.I "------> FILE <------"
+header. Between files the pager prompts with
+.IR "--More--(Next file: FILE)" ;
+answers
+.B e
+or
+.B q
+quit, while
+.B s
+skips the next file.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Usage or I/O error.
+.SH SEE ALSO
+.BR bzip3 (1),
+.BR more (1),
+.BR less (1),
+.BR bz3grep (1),
+.BR bz3diff (1)

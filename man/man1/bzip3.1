@@ -1,0 +1,169 @@
+.TH BZIP3 1 "2026-10-21" "bzip3-rs" "User Commands"
+.SH NAME
+bzip3 \- a block-sorting file compressor
+.SH SYNOPSIS
+.B bzip3
+.RB [ \-e / \-z / \-d / \-t / \-r ]
+.RB [ \-c ]
+.RB [ \-f ]
+.RB [ \-k ]
+.RB [ \-q ]
+.RB [ \-v ]
+.RB [ \-b
+.IR N ]
+.RB [ \-j
+.IR N ]
+.RB [ \-1..\-14 ]
+.RB [ \-\-fast ]
+.RB [ \-\-best ]
+.RB [ \-B ]
+.RI [ files... ]
+.SH DESCRIPTION
+.B bzip3
+compresses to and decompresses from the bzip3 format.
+Every positional is an independent input; there is no
+.I "in out"
+form. With no files, standard input is processed to standard
+output.
+.B \-B
+is accepted for compatibility and ignored.
+.PP
+Encode appends
+.B .bz3
+to the input name. Encode refuses inputs already ending in
+.BR .bz3
+.RI ( "already has .bz3 suffix" ,
+exit 1).
+Decode strips one trailing
+.B .bz3
+(case-sensitive); any other name decodes to
+.IB name .out
+with a
+.I "Can't guess original name"
+notice, suppressed by
+.BR \-q .
+.PP
+A successful file-to-file run deletes the input unless
+.B \-k
+is given.
+.BR \-c ,
+.B \-t ,
+.B \-r
+and standard-input runs never delete; failures never delete.
+The output inherits the input mode and modification time.
+A failed run removes its partial output, except in recover mode.
+.PP
+.B \-\-rm
+is rejected as an unknown flag.
+.B \-f
+only permits overwriting outputs; it never passes non-bzip3
+bytes through.
+.B bzip3
+refuses to write compressed bytes to a terminal and refuses to
+read compressed bytes from a terminal.
+.SH OPTIONS
+.TP
+.BR \-e ", " \-z ", " \-\-encode
+Compress (default). The last mode flag wins.
+.TP
+.BR \-d ", " \-\-decode
+Decompress.
+.TP
+.BR \-t ", " \-\-test
+Verify compressed input without writing output.
+.TP
+.BR \-r ", " \-\-recover
+Decompress damaged input. Every block that the tool can find goes to the
+output, so the offsets after a damaged block stay correct.
+A block whose only fault is the checksum keeps its decoded bytes.
+Any other damaged block gives zero bytes.
+Each damaged block prints
+.I "Writing invalid block"
+with its number, its input offset, its fault and its output range
+on standard error.
+The line tells if the output bytes keep the decoded bytes or are zero.
+A bad block header or missing data stops the run;
+the blocks before it stay in the output.
+The tool then prints
+.I "Recovery stopped"
+with the block number, the input offset and the output size.
+Blocks have no sync marker, so the tool does not search for the next block.
+A bad block size in the frame header prints
+.I "Recovery mode: Proceeding."
+and takes the block size from the block headers.
+A bad signature or a short frame header is still fatal.
+Recover mode never deletes the input file and keeps its output after a failure.
+It differs from the reference: the reference exits 0 after a damaged block
+and writes its decode buffer instead of zero bytes.
+The reference also uses 511 MiB after a bad block size in the frame header.
+.TP
+.BR \-c ", " \-\-stdout
+Write to standard output.
+.TP
+.BR \-f ", " \-\-force
+Overwrite an existing output file.
+.TP
+.BR \-k ", " \-\-keep
+Keep (do not delete) input files on success.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress non-critical warnings only; errors always print.
+.TP
+.BR \-v ", " \-\-verbose
+Print byte counts and ratios to standard error.
+.TP
+.BR \-b " " \fIN\fR ", " \-\-block=\fIN\fR
+Block size: bare \fIN\fR or \fIN\fRM/\fIN\fRMiB is MiB, \fIN\fRK/\fIN\fRKiB
+is KiB, case-insensitive, 65 KiB to 511 MiB. Default is 16M. The last of
+.B \-b
+and the level flags wins.
+.TP
+.BR \-1 .. \-14
+Compression level: 1=65KiB, 2=128KiB, 3=256KiB, 4=512KiB, 5=1MiB,
+6=2MiB, 7=4MiB, 8=8MiB, 9=16MiB (default), 10=32MiB, 11=64MiB,
+12=128MiB, 13=256MiB, 14=511MiB. Levels are exact tokens;
+clusters like \-19 are rejected. Encode only;
+decode ignores levels.
+.TP
+.BR \-\-fast
+Fastest mode, same as
+.BR \-1 .
+.TP
+.BR \-\-best
+Best mode, same as
+.BR \-14 .
+.TP
+.BR \-j " " \fIN\fR ", " \-\-jobs=\fIN\fR
+Worker thread count, 0 to 64. 0 (default) uses physical cores,
+limited by available parallelism and clamped to 64. 1 runs serially;
+2 to 64 select that many workers.
+.TP
+.BR \-B ", " \-\-batch
+Accepted and ignored; every positional already runs alone.
+.TP
+.BR \-h ", " \-\-help
+Print help and exit 0.
+.TP
+.BR \-V ", " \-\-version
+Print version and exit 0.
+.SH EXIT STATUS
+.TP
+.B 0
+Success, help, or version.
+.TP
+.B 1
+Bad flags, unreadable or missing input, existing output without
+.BR \-f ,
+terminal refusal, or allocation failure. With several files the
+worst per-file code is returned.
+.TP
+.B 2
+Corrupt data: bad magic, truncated input, bad header size,
+inconsistent headers, block or CRC failure, or a trailing byte.
+Recover mode also returns 2 when it found a damaged block or stopped early.
+.SH SEE ALSO
+.BR bunzip3 (1),
+.BR bz3cat (1),
+.BR bz3grep (1),
+.BR bz3diff (1),
+.BR bz3more (1)

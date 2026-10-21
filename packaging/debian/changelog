@@ -1,0 +1,6 @@
+bzip3-rs (1.0.0-1) unstable; urgency=low
+
+  * Initial Debian package of the pure-Rust bzip3 port.
+    See CHANGELOG.md in the source for the full list of changes.
+
+ -- Karol Harasim <karol.harasim@gmail.com>  Wed, 21 Oct 2026 00:00:00 +0000

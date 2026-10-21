@@ -1,6 +1,6 @@
 [package]
 name = "bzip3-rs"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.88"
 license = "LGPL-3.0-only AND Apache-2.0"

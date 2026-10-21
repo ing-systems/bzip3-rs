@@ -1,7 +1,7 @@
 # Maintainer: TODO <support@ing-systems.com>
 # Note: binary target is bzip3, package/library is bzip3-rs/bzip3_rs.
 pkgname=bzip3-rs
-pkgver=1.0.0
+pkgver=1.0.1
 pkgrel=1
 pkgdesc='Pure-Rust port of the bzip3 compressor'
 arch=('x86_64')

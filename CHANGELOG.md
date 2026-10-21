@@ -12,6 +12,12 @@ The project follows [Semantic Versioning](https://semver.org/).
 - `BlockDecoder::recover_block_into` and `BlockStatus`. The method keeps the data of a damaged block. The value tells if the bytes are intact, kept after a checksum fault, or zero.
 - Debian and Ubuntu `.deb` packages for amd64 and arm64. A workflow builds them and attaches them to each release.
 
+## [1.0.1] - 2026-10-21
+
+### Fixed
+
+- Fix Windows test build: gate non-UTF8 level-token fixtures by OS.
+
 ## [1.0.0] - 2026-10-21
 
 ### Added

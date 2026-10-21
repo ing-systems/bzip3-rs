@@ -1584,19 +1584,40 @@ mod tests {
         assert_eq!(os_error_text(&other), "custom boom");
     }
 
+    #[cfg(unix)]
+    fn non_utf8_level_tokens() -> Vec<OsString> {
+        use std::os::unix::ffi::OsStrExt as _;
+        vec![
+            OsStr::from_bytes(b"\xff\xfe").to_owned(),
+            OsStr::from_bytes(b"-\xff").to_owned(),
+        ]
+    }
+
+    #[cfg(windows)]
+    fn non_utf8_level_tokens() -> Vec<OsString> {
+        use std::os::windows::ffi::OsStringExt as _;
+        vec![
+            OsString::from_wide(&[0xD800]),
+            OsString::from_wide(&[u16::from(b'-'), 0xD800]),
+        ]
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn non_utf8_level_tokens() -> Vec<OsString> {
+        Vec::new()
+    }
+
     #[test]
     fn parse_level_token_covers_edges() {
-        use std::os::unix::ffi::OsStrExt as _;
         assert_eq!(parse_level_token(OsStr::new("-1")), Some(1));
         assert_eq!(parse_level_token(OsStr::new("-14")), Some(14));
         assert_eq!(parse_level_token(OsStr::new("-01")), Some(1));
         for text in ["", "-", "--1", "-0", "-15", "-19", "1", "-1a", "-x", "--"] {
             assert_eq!(parse_level_token(OsStr::new(text)), None, "{text}");
         }
-        let raw = OsStr::from_bytes(b"\xff\xfe");
-        assert_eq!(parse_level_token(raw), None);
-        let raw = OsStr::from_bytes(b"-\xff");
-        assert_eq!(parse_level_token(raw), None);
+        for raw in non_utf8_level_tokens() {
+            assert_eq!(parse_level_token(&raw), None);
+        }
     }
 
     #[test]

@@ -1341,6 +1341,36 @@ mod tests {
     }
 
     #[test]
+    fn suffix_rule_keeps_non_utf8_bytes() {
+        use super::append_suffix;
+        use super::has_bz3_suffix;
+        // Build a name without valid UTF-8.
+        // The file system stays out of this test.
+        #[cfg(unix)]
+        fn plain() -> PathBuf {
+            use std::os::unix::ffi::OsStrExt as _;
+            PathBuf::from(OsStr::from_bytes(b"\xff.bin"))
+        }
+        #[cfg(windows)]
+        fn plain() -> PathBuf {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt as _;
+            let mut name = OsString::from_wide(&[0xD800]);
+            name.push(".bin");
+            PathBuf::from(name)
+        }
+        #[cfg(not(any(unix, windows)))]
+        fn plain() -> PathBuf {
+            PathBuf::from("skip.bin")
+        }
+        let path = plain();
+        assert!(!has_bz3_suffix(&path));
+        let coded = append_suffix(&path, ".bz3");
+        assert!(has_bz3_suffix(&coded));
+        assert_eq!(strip_bz3_suffix(&coded), Some(path));
+    }
+
+    #[test]
     fn alias_selects_default_mode() {
         let alias = |name: &str| Alias::from_argv0(Some(OsStr::new(name)));
         assert_eq!(alias("/usr/bin/bunzip3"), Alias::Bunzip3);

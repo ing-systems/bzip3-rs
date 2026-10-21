@@ -279,19 +279,19 @@ fn decode_worker_counts_agree_on_multi_block() {
     assert_eq!(serial.stdout, bytes, "serial decode must match");
 }
 
-/// A name that is not valid UTF-8 keeps its bytes through encode and decode.
-#[cfg(unix)]
+/// A name that is not valid UTF-8 keeps its bytes.
+/// Skip the test when the file system rejects the name.
 #[test]
 fn non_utf8_name_round_trips() {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
+    use std::ffi::OsString;
     use std::process::Command;
 
     let s = scratch("non-utf8");
-    let plain = OsStr::from_bytes(b"\xff.bin");
-    let coded = OsStr::from_bytes(b"\xff.bin.bz3");
-    std::fs::write(s.dir.join(plain), b"hello hello hello hello").expect("write input");
-    for (flag, name) in [("-e", plain), ("-d", coded)] {
+    let (plain, coded): (OsString, OsString) = non_utf8_names();
+    if std::fs::write(s.dir.join(&plain), b"hello hello hello hello").is_err() {
+        return;
+    }
+    for (flag, name) in [("-e", &plain), ("-d", &coded)] {
         let out = Command::new(crate::support::bin())
             .arg(flag)
             .arg(name)
@@ -305,7 +305,41 @@ fn non_utf8_name_round_trips() {
         );
     }
     assert_eq!(
-        std::fs::read(s.dir.join(plain)).expect("read output"),
+        std::fs::read(s.dir.join(&plain)).expect("read output"),
         b"hello hello hello hello"
     );
+}
+
+/// Build a plain name and a coded name without valid UTF-8.
+/// Use one lone byte on Unix.
+#[cfg(unix)]
+fn non_utf8_names() -> (std::ffi::OsString, std::ffi::OsString) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    let plain = OsStr::from_bytes(b"\xff.bin").to_owned();
+    let mut coded = plain.clone();
+    coded.push(".bz3");
+    (plain, coded)
+}
+
+/// Build a plain name and a coded name without valid UTF-8.
+/// Use one lone surrogate on Windows.
+#[cfg(windows)]
+fn non_utf8_names() -> (std::ffi::OsString, std::ffi::OsString) {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt as _;
+    let mut plain = OsString::from_wide(&[0xD800]);
+    plain.push(".bin");
+    let mut coded = plain.clone();
+    coded.push(".bz3");
+    (plain, coded)
+}
+
+/// Build a dummy pair on other systems.
+#[cfg(not(any(unix, windows)))]
+fn non_utf8_names() -> (std::ffi::OsString, std::ffi::OsString) {
+    (
+        std::ffi::OsString::from("skip.bin"),
+        std::ffi::OsString::from("skip.bin.bz3"),
+    )
 }

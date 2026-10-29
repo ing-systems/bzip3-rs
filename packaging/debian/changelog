@@ -1,3 +1,12 @@
+bzip3-rs (1.1.0-1) unstable; urgency=low
+
+  * Recover mode for the bzip3 tool (-r, --recover).
+  * BlockDecoder::recover_block_into and BlockStatus.
+  * Debian and Ubuntu .deb packages for amd64 and arm64.
+  * Faster decode on x86-64-v3 / native builds.
+
+ -- Karol Harasim <karol.harasim@gmail.com>  Thu, 29 Oct 2026 00:00:00 +0000
+
 bzip3-rs (1.0.1-1) unstable; urgency=low
 
   * Fix Windows test build: gate non-UTF8 level-token fixtures by OS.

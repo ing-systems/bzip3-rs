@@ -6,11 +6,15 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-29
+
 ### Added
 
 - Recover mode for the `bzip3` tool: `-r` and `--recover`. It writes every block that it can decode. Each damaged block prints its number, input offset and output range. See the README for the differences from C bzip3.
 - `BlockDecoder::recover_block_into` and `BlockStatus`. The method keeps the data of a damaged block. The value tells if the bytes are intact, kept after a checksum fault, or zero.
 - Debian and Ubuntu `.deb` packages for amd64 and arm64. A workflow builds them and attaches them to each release.
+
+Note: the recover API and the `.deb` packages already shipped in the 1.0.1 crate. Version 1.1.0 is the first version to cover them in release notes.
 
 ### Changed
 

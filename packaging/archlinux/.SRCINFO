@@ -1,6 +1,6 @@
 pkgbase = bzip3-rs
 	pkgdesc = Pure-Rust port of the bzip3 compressor
-	pkgver = 1.0.1
+	pkgver = 1.1.0
 	pkgrel = 1
 	url = https://github.com/ing-systems/bzip3-rs
 	arch = x86_64
@@ -10,7 +10,7 @@ pkgbase = bzip3-rs
 	makedepends = git
 	depends = glibc
 	depends = gcc-libs
-	source = bzip3-rs::git+https://github.com/ing-systems/bzip3-rs.git#tag=v1.0.1
+	source = bzip3-rs::git+https://github.com/ing-systems/bzip3-rs.git#tag=v1.1.0
 	sha256sums = SKIP
 
 pkgname = bzip3-rs

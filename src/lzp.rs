@@ -46,6 +46,7 @@ pub type HashTable = [i32; TABLE_LEN];
 /// # Errors
 ///
 /// Returns [`Error::OutOfMemory`] when the table allocation fails.
+#[inline]
 pub fn new_table() -> Result<Box<HashTable>> {
     filled(TABLE_LEN, 0)
         .and_then(|table| table.into_boxed_slice().try_into().ok())
@@ -81,8 +82,23 @@ fn context_at(block: &[u8], end: usize) -> u32 {
 /// larger output stays byte-identical to the reference. Returns `None`
 /// exactly where the reference returns `-1`. Clears the table on entry.
 #[must_use]
+#[inline]
 pub fn encode_into(input: &[u8], output: &mut [u8], table: &mut HashTable) -> Option<usize> {
     encode_kernel(input, output, table)
+}
+
+/// Cursor of either LZP pass: input and output positions plus context.
+///
+/// Bundles the positions that the match and tail helpers move together,
+/// so each helper takes few arguments.
+#[derive(Debug)]
+struct PassCursor {
+    /// Next input offset to code, or next coded offset to read.
+    pos: usize,
+    /// Next output offset to write.
+    next_out: usize,
+    /// Context of the bytes before the written output.
+    ctx: u32,
 }
 
 // Reason: positions stay below 2 GiB through the block API, so the
@@ -101,72 +117,157 @@ fn encode_kernel(input: &[u8], output: &mut [u8], table: &mut HashTable) -> Opti
     }
     table.fill(0);
     output[..4].copy_from_slice(&input[..4]);
-    let mut pos = 4_usize;
-    let mut next_out = 4_usize;
+    let mut cursor = PassCursor {
+        pos: 4,
+        next_out: 4,
+        ctx: context_at(input, 4),
+    };
     let end = input.len();
     let bound = end - MIN_INPUT;
     let out_eob = end - ENCODE_RESERVE;
-    let mut ctx = context_at(input, 4);
     // Latest input offset covered by a rejected short match. Later match
     // tries must still agree with the rejected bytes at this offset.
     let mut heur = 0_usize;
-    while pos < bound && next_out < out_eob {
-        let slot = hash(ctx);
+    while cursor.pos < bound && cursor.next_out < out_eob {
+        let slot = hash(cursor.ctx);
         let val = table[slot];
-        table[slot] = pos as i32;
+        table[slot] = cursor.pos as i32;
         if val > 0 {
             let ref_pos = val as usize;
             // Both windows sit inside the input: `pos + 40` stays below
             // `end - 32`, and `ref_pos` stays below `pos`.
-            if load(input, pos + MIN_MATCH - 4) == load(input, ref_pos + MIN_MATCH - 4)
-                && load(input, pos) == load(input, ref_pos)
-                && !(heur > pos && load(input, heur) != load(input, ref_pos + (heur - pos)))
-            {
-                let mut len = extend_match(input, pos, ref_pos, bound);
+            if usable_match(input, cursor.pos, ref_pos, heur) {
+                let len = extend_match(input, cursor.pos, ref_pos, bound);
                 if len < MIN_MATCH {
-                    // Short matches stay literal, but they fence later tries.
-                    // `heur` stays below `end - 32`, so later reads stay safe.
-                    if heur < pos + len {
-                        heur = pos + len;
-                    }
-                    emit_literal(output, input, &mut pos, &mut next_out, &mut ctx, true);
+                    fence_short(&mut heur, cursor.pos, len);
+                    emit_literal(
+                        output,
+                        input,
+                        &mut cursor.pos,
+                        &mut cursor.next_out,
+                        &mut cursor.ctx,
+                        true,
+                    );
                 } else {
-                    // Tail reads stay inside the input: the word loop leaves
-                    // `pos + len` below `end - 66`, and `ref_pos` below `pos`.
-                    for _ in 0..3 {
-                        if input[pos + len] == input[ref_pos + len] {
-                            len += 1;
-                        }
-                    }
-                    pos += len;
-                    ctx = context_at(input, pos);
-                    output[next_out] = MATCH_MARKER;
-                    next_out += 1;
-                    write_match_len(output, &mut next_out, out_eob, len - MIN_MATCH);
+                    let grown = match_tail_len(input, cursor.pos, ref_pos, len);
+                    push_match(input, output, &mut cursor, grown, out_eob);
                 }
             } else {
                 // Warm slot without usable match: same miss rule as above.
-                emit_literal(output, input, &mut pos, &mut next_out, &mut ctx, true);
+                emit_literal(
+                    output,
+                    input,
+                    &mut cursor.pos,
+                    &mut cursor.next_out,
+                    &mut cursor.ctx,
+                    true,
+                );
             }
         } else {
             // Cold slot: the decoder reads the marker as one literal byte,
             // so no escape byte follows.
-            emit_literal(output, input, &mut pos, &mut next_out, &mut ctx, false);
+            emit_literal(
+                output,
+                input,
+                &mut cursor.pos,
+                &mut cursor.next_out,
+                &mut cursor.ctx,
+                false,
+            );
         }
     }
     // The tail pass copies literals only. It still escapes a marker when
     // the decoder would take the match path for the same table state.
-    ctx = context_at(input, pos);
-    while pos < end && next_out < out_eob {
-        let slot = hash(ctx);
-        let val = table[slot];
-        table[slot] = pos as i32;
-        emit_literal(output, input, &mut pos, &mut next_out, &mut ctx, val > 0);
-    }
-    if next_out >= out_eob {
+    encode_tail(input, output, table, &mut cursor, out_eob, end);
+    if cursor.next_out >= out_eob {
         return None;
     }
-    Some(next_out)
+    Some(cursor.next_out)
+}
+
+/// Test whether the table hit at `ref_pos` can code `pos`.
+///
+/// Compares the first and match words and checks the rejected-match
+/// fence, exactly as the reference does.
+#[inline]
+fn usable_match(input: &[u8], pos: usize, ref_pos: usize, heur: usize) -> bool {
+    load(input, pos + MIN_MATCH - 4) == load(input, ref_pos + MIN_MATCH - 4)
+        && load(input, pos) == load(input, ref_pos)
+        && !(heur > pos && load(input, heur) != load(input, ref_pos + (heur - pos)))
+}
+
+/// Grow `len` past the word loop with the three tail bytes.
+///
+/// Tail reads stay inside the input: the word loop leaves `pos + len`
+/// below `end - 66`, and `ref_pos` stays below `pos`.
+#[inline]
+fn match_tail_len(input: &[u8], pos: usize, ref_pos: usize, mut len: usize) -> usize {
+    for _ in 0..3 {
+        if input[pos + len] == input[ref_pos + len] {
+            len += 1;
+        }
+    }
+    len
+}
+
+/// Fence later match tries after a rejected short match.
+///
+/// Short matches stay literal, but they fence later tries.
+/// `heur` stays below `end - 32`, so later reads stay safe.
+#[inline]
+const fn fence_short(heur: &mut usize, pos: usize, len: usize) {
+    if *heur < pos + len {
+        *heur = pos + len;
+    }
+}
+
+/// Record one match run of `len` bytes at the cursor.
+///
+/// Moves past the run, refreshes the context, and stores the marker
+/// plus the length minus [`MIN_MATCH`] as base 254 digits.
+fn push_match(
+    input: &[u8],
+    output: &mut [u8],
+    cursor: &mut PassCursor,
+    len: usize,
+    out_eob: usize,
+) {
+    cursor.pos += len;
+    cursor.ctx = context_at(input, cursor.pos);
+    output[cursor.next_out] = MATCH_MARKER;
+    cursor.next_out += 1;
+    write_match_len(output, &mut cursor.next_out, out_eob, len - MIN_MATCH);
+}
+
+/// Copy the trailing literals that the main loop leaves.
+///
+/// Still escapes a marker when the decoder would take the match path
+/// for the same table state.
+// Reason: positions stay below 2 GiB through the block API, so the
+// store below wraps exactly where the reference relies on 32-bit slots.
+#[expect(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+fn encode_tail(
+    input: &[u8],
+    output: &mut [u8],
+    table: &mut HashTable,
+    cursor: &mut PassCursor,
+    out_eob: usize,
+    end: usize,
+) {
+    cursor.ctx = context_at(input, cursor.pos);
+    while cursor.pos < end && cursor.next_out < out_eob {
+        let slot = hash(cursor.ctx);
+        let val = table[slot];
+        table[slot] = cursor.pos as i32;
+        emit_literal(
+            output,
+            input,
+            &mut cursor.pos,
+            &mut cursor.next_out,
+            &mut cursor.ctx,
+            val > 0,
+        );
+    }
 }
 
 /// Count the bytes that `pos` and `ref_pos` share, in steps of 4 bytes.
@@ -272,14 +373,8 @@ const fn write_match_len(
 }
 
 // Reason: positions stay below 2 GiB through the block API, so the
-// casts below wrap exactly where the reference relies on 32-bit slots.
-// Reason: `ref_pos` and the copy end derive from positive lengths, so
-// they never go negative. Small outputs clamp through `max_len`.
-#[expect(
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation
-)]
+// slot store below wraps exactly where the reference relies on 32-bit slots.
+#[expect(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 /// Decode `input` into `output` with scratch table `table`.
 ///
 /// Needs `input.len() >= 4`, `output.len() >= 4`, and `table.len() >=
@@ -297,62 +392,103 @@ pub fn decode_into(input: &[u8], output: &mut [u8], table: &mut HashTable) -> Re
     }
     table.fill(0);
     output[..4].copy_from_slice(&input[..4]);
-    let mut pos = 4_usize;
-    let mut next_out = 4_usize;
+    let mut cursor = PassCursor {
+        pos: 4,
+        next_out: 4,
+        ctx: context_at(output, 4),
+    };
     let end = input.len();
     let capacity = output.len();
-    let mut ctx = context_at(output, 4);
-    while pos < end && next_out < capacity {
-        let slot = hash(ctx);
+    while cursor.pos < end && cursor.next_out < capacity {
+        let slot = hash(cursor.ctx);
         let val = table[slot];
-        table[slot] = next_out as i32;
-        if input[pos] == MATCH_MARKER && val > 0 {
-            pos += 1;
-            if pos == end {
-                return Err(Error::CorruptStageData);
-            }
-            if input[pos] == ESCAPE {
-                pos += 1;
-                output[next_out] = MATCH_MARKER;
-                next_out += 1;
-                ctx = (ctx << 8) | u32::from(MATCH_MARKER);
-            } else {
-                let max_len = capacity - next_out;
-                let mut len = MIN_MATCH;
-                loop {
-                    if pos == end {
-                        return Err(Error::CorruptStageData);
-                    }
-                    // `len` stays within `max_len` plus one digit, so it cannot wrap.
-                    if len <= max_len {
-                        len += usize::from(input[pos]);
-                    }
-                    let byte = input[pos];
-                    pos += 1;
-                    if byte != LENGTH_BYTE {
-                        break;
-                    }
-                }
-                // Stored slots only hold past output offsets, so `ref_pos`
-                // stays below `next_out` and every read lands inside `output`.
-                let ref_pos = val as usize;
-                let stop = if len > max_len {
-                    capacity
-                } else {
-                    next_out + len
-                };
-                copy_match(output, ref_pos, stop, &mut next_out);
-                ctx = context_at(output, next_out);
-            }
+        table[slot] = cursor.next_out as i32;
+        if input[cursor.pos] == MATCH_MARKER && val > 0 {
+            decode_marker(input, output, &mut cursor, val, end, capacity)?;
         } else {
-            let next = input[pos];
-            output[next_out] = next;
-            next_out += 1;
-            pos += 1;
-            ctx = (ctx << 8) | u32::from(next);
+            let next = input[cursor.pos];
+            output[cursor.next_out] = next;
+            cursor.next_out += 1;
+            cursor.pos += 1;
+            cursor.ctx = (cursor.ctx << 8) | u32::from(next);
         }
     }
-    Ok(next_out)
+    Ok(cursor.next_out)
+}
+
+// Reason: `ref_pos` derives from a positive slot, so it never goes negative.
+#[expect(clippy::cast_sign_loss)]
+/// Decode one marker run: an escaped literal or a match copy.
+///
+/// Reads the length digits, copies the match clamped to the free
+/// output space, and refreshes the context.
+///
+/// # Errors
+///
+/// Returns [`Error::CorruptStageData`] when the payload ends inside
+/// the run or the buffers cannot hold a valid decode.
+#[inline]
+fn decode_marker(
+    input: &[u8],
+    output: &mut [u8],
+    cursor: &mut PassCursor,
+    val: i32,
+    end: usize,
+    capacity: usize,
+) -> Result<()> {
+    cursor.pos += 1;
+    if cursor.pos == end {
+        return Err(Error::CorruptStageData);
+    }
+    if input[cursor.pos] == ESCAPE {
+        cursor.pos += 1;
+        output[cursor.next_out] = MATCH_MARKER;
+        cursor.next_out += 1;
+        cursor.ctx = (cursor.ctx << 8) | u32::from(MATCH_MARKER);
+    } else {
+        let max_len = capacity - cursor.next_out;
+        let len = read_match_len(input, &mut cursor.pos, end, max_len)?;
+        // Stored slots only hold past output offsets, so `ref_pos`
+        // stays below `next_out` and every read lands inside `output`.
+        let ref_pos = val as usize;
+        let stop = if len > max_len {
+            capacity
+        } else {
+            cursor.next_out + len
+        };
+        copy_match(output, ref_pos, stop, &mut cursor.next_out);
+        cursor.ctx = context_at(output, cursor.next_out);
+    }
+    Ok(())
+}
+
+/// Read the base 254 length digits of one match run.
+///
+/// Adds each digit while `len` stays within `max_len` plus one digit,
+/// so the total cannot wrap. Advances `pos` past the terminator.
+///
+/// # Errors
+///
+/// Returns [`Error::CorruptStageData`] when the payload ends inside
+/// the run.
+#[inline]
+fn read_match_len(input: &[u8], pos: &mut usize, end: usize, max_len: usize) -> Result<usize> {
+    let mut len = MIN_MATCH;
+    loop {
+        if *pos == end {
+            return Err(Error::CorruptStageData);
+        }
+        // `len` stays within `max_len` plus one digit, so it cannot wrap.
+        if len <= max_len {
+            len += usize::from(input[*pos]);
+        }
+        let byte = input[*pos];
+        *pos += 1;
+        if byte != LENGTH_BYTE {
+            break;
+        }
+    }
+    Ok(len)
 }
 
 /// Copy a match run, so overlaps repeat fresh bytes.

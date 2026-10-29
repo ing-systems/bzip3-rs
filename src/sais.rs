@@ -61,11 +61,21 @@ pub fn bwt_with(input: &[u8], output: &mut [u8], scratch: &mut BwtScratch) -> Re
 
     let n = input.len();
     scratch.sort_suffixes(input)?;
-    let sa = &scratch.sa[..n];
-    // Assemble the last column. This matches the reference copy:
-    // `U[0]` is the byte before suffix 0, hence `input[n - 1]`. The
-    // byte before each other suffix follows in rank order. The slot
-    // of suffix 0 is the primary slot and has no byte of its own.
+    assemble_bwt(input, &scratch.sa[..n], output)
+}
+
+/// Assemble the last column of the sorted rotation matrix.
+///
+/// Matches the reference copy: `output[0]` is the byte before suffix
+/// 0, hence `input[n - 1]`. The byte before each other suffix follows
+/// in rank order. The slot of suffix 0 is the primary slot and has no
+/// byte of its own. Returns the 1-based primary index.
+///
+/// # Errors
+///
+/// Returns [`Error::BwtFailed`] when no suffix sits at position 0.
+fn assemble_bwt(input: &[u8], sa: &[u32], output: &mut [u8]) -> Result<i32> {
+    let n = input.len();
     output[0] = input[n - 1];
     let mut slot = 1;
     let mut primary = None;
@@ -147,24 +157,9 @@ pub fn unbwt_with(
     scratch: &mut UnbwtScratch,
 ) -> Result<()> {
     // Port of the `libsais_unbwt` front end (`libsais_unbwt_aux`
-    // with one index): the guards run first, in reference order.
-    if output.len() < transform.len() {
-        return Err(Error::BwtFailed);
-    }
-    if transform.is_empty() {
-        // The reference requires the single index to equal `n`.
-        return if index == 0 {
-            Ok(())
-        } else {
-            Err(Error::BwtFailed)
-        };
-    }
-    if transform.len() == 1 {
-        if index != 1 {
-            return Err(Error::BwtFailed);
-        }
-        output[0] = transform[0];
-        return Ok(());
+    // with one index): the edge cases run first, in reference order.
+    if let Some(done) = unbwt_edge_case(transform, output, index) {
+        return done;
     }
     // The reference requires `1 <= index <= n`.
     if index < 1 {
@@ -184,12 +179,7 @@ pub fn unbwt_with(
     // Count each byte, then turn counts into 1-based group starts.
     let mut count = [0_usize; 256];
     unbwt_histogram(transform, &mut count);
-    let mut start = [0_usize; 256];
-    let mut next_free = 1_usize;
-    for (slot, &group) in start.iter_mut().zip(count.iter()) {
-        *slot = next_free;
-        next_free += group;
-    }
+    let start = unbwt_starts(&count);
 
     // Count bigrams in stored order, then transpose the table.
     let UnbwtScratch { bigram, fast, link } = scratch;
@@ -199,10 +189,7 @@ pub fn unbwt_with(
 
     // Turn bigram counts into starts and build the lookup table.
     let last = transform[0];
-    let mut shift = 0_usize;
-    while (n >> shift) > (1_usize << 17) {
-        shift += 1;
-    }
+    let shift = unbwt_shift(n);
     refill_buffer(fast, 1 + (n >> shift), 0)?;
     unbwt_fastbits(bigram, usize::from(last), shift, fast);
 
@@ -212,10 +199,68 @@ pub fn unbwt_with(
     unbwt_emit_pairs(link, bigram, fast, shift, primary, last, output)
 }
 
+/// Handle the empty and single-byte transforms.
+///
+/// Returns `None` when the general path applies. The single-byte
+/// check keeps the reference order: the output-size guard runs before
+/// the index check, exactly as the front end does.
+///
+/// # Errors
+///
+/// Returns [`Error::BwtFailed`] under the same conditions as the
+/// plain inverse transform on these inputs.
+#[cold]
+const fn unbwt_edge_case(transform: &[u8], output: &mut [u8], index: i32) -> Option<Result<()>> {
+    if output.len() < transform.len() {
+        return Some(Err(Error::BwtFailed));
+    }
+    if transform.is_empty() {
+        // The reference requires the single index to equal `n`.
+        return Some(if index == 0 {
+            Ok(())
+        } else {
+            Err(Error::BwtFailed)
+        });
+    }
+    if transform.len() == 1 {
+        if index != 1 {
+            return Some(Err(Error::BwtFailed));
+        }
+        output[0] = transform[0];
+        return Some(Ok(()));
+    }
+    None
+}
+
+/// Turn byte counts into 1-based group starts.
+#[inline]
+fn unbwt_starts(count: &[usize; 256]) -> [usize; 256] {
+    let mut start = [0_usize; 256];
+    let mut next_free = 1_usize;
+    for (slot, &group) in start.iter_mut().zip(count.iter()) {
+        *slot = next_free;
+        next_free += group;
+    }
+    start
+}
+
+/// Pick the lookup shift that keeps the fast table small.
+///
+/// The table holds `1 + (n >> shift)` entries.
+#[inline]
+const fn unbwt_shift(n: usize) -> usize {
+    let mut shift = 0_usize;
+    while (n >> shift) > (1_usize << 17) {
+        shift += 1;
+    }
+    shift
+}
+
 /// Count each byte value in `data`.
 ///
 /// Matches the reference histogram totals. The reference counts
 /// with an unrolled 4-way loop; this loop writes the same totals.
+#[inline]
 fn unbwt_histogram(data: &[u8], count: &mut [usize; 256]) {
     for &byte in data {
         count[usize::from(byte)] += 1;
@@ -228,6 +273,7 @@ fn unbwt_histogram(data: &[u8], count: &mut [usize; 256]) {
 /// skipping the primary slot exactly like the reference: the low
 /// part covers the stored items before the slot, the high part
 /// covers the items after it. Counts land at `(c << 8) + d`.
+#[inline]
 fn unbwt_bigram_counts(
     transform: &[u8],
     start: &[usize; 256],
@@ -240,16 +286,22 @@ fn unbwt_bigram_counts(
         let total = first + count[c];
         let hi = total.min(primary);
         if let Some(window) = transform.get(first..hi) {
-            for &byte in window {
-                bigram[(c << 8) + usize::from(byte)] += 1;
-            }
+            count_bigram_window(window, bigram, c);
         }
         let lo = first.max(primary + 1);
         if let Some(window) = transform.get(lo - 1..total - 1) {
-            for &byte in window {
-                bigram[(c << 8) + usize::from(byte)] += 1;
-            }
+            count_bigram_window(window, bigram, c);
         }
+    }
+}
+
+/// Count the bytes of one group window into the bigram row of `c`.
+///
+/// Counts land at `(c << 8) + d`, exactly as the stored-order scan does.
+#[inline]
+fn count_bigram_window(window: &[u8], bigram: &mut [u32], c: usize) {
+    for &byte in window {
+        bigram[(c << 8) + usize::from(byte)] += 1;
     }
 }
 
@@ -258,6 +310,7 @@ fn unbwt_bigram_counts(
 /// Swap every `(x, y)` count with `(y, x)`, so each entry holds
 /// the count of its bigram in first/second order. The reference
 /// swaps in cache-sized blocks; this loop writes the same table.
+#[inline]
 fn unbwt_transpose_bigrams(bigram: &mut [u32]) {
     for x in 0..256 {
         for y in (x + 1)..256 {
@@ -273,6 +326,7 @@ fn unbwt_transpose_bigrams(bigram: &mut [u32]) {
 /// `fast[p >> shift]` names a bigram at or before position `p`.
 /// Positions stay below `n + 2`, and `n` is at most `i32::MAX`, so
 /// they fit `u32`.
+#[inline]
 fn unbwt_fastbits(bigram: &mut [u32], last: usize, shift: usize, fast: &mut [u16]) {
     let mut pos = 0_usize;
     let mut total = 1_u32;
@@ -285,11 +339,21 @@ fn unbwt_fastbits(bigram: &mut [u32], last: usize, shift: usize, fast: &mut [u16
         total += *slot;
         *slot = prev;
         if prev != total {
-            while pos <= ((total - 1) as usize >> shift) {
-                fast[pos] = pair;
-                pos += 1;
-            }
+            fill_fast_before(fast, &mut pos, pair, total, shift);
         }
+    }
+}
+
+/// Fill the lookup table with `pair` up to the end of its range.
+///
+/// `fast[p >> shift]` then names a bigram at or before position `p`.
+/// Positions stay below `n + 2`, and `n` is at most `i32::MAX`, so
+/// they fit `u32`.
+#[inline]
+const fn fill_fast_before(fast: &mut [u16], pos: &mut usize, pair: u16, total: u32, shift: usize) {
+    while *pos <= ((total - 1) as usize >> shift) {
+        fast[*pos] = pair;
+        *pos += 1;
     }
 }
 
@@ -338,6 +402,7 @@ fn unbwt_bipsi(
 /// the two bigram bytes. The length `n` is one less than the
 /// link table size. The final byte is the stored first byte,
 /// which the paired walk cannot reach on odd lengths.
+#[inline]
 fn unbwt_emit_pairs(
     link: &[u32],
     end: &[u32],
@@ -351,15 +416,30 @@ fn unbwt_emit_pairs(
     let mut pos = primary;
     // An even length fills all `n` bytes, then `last` replaces the final one.
     for chunk in output[..n - n % 2].as_chunks_mut::<2>().0 {
-        let mut pair = fast[pos >> shift];
-        while end[usize::from(pair)] as usize <= pos {
-            pair = pair.checked_add(1).ok_or(Error::BwtFailed)?;
-        }
+        let pair = find_pair(end, fast, shift, pos)?;
         pos = link[pos] as usize;
         *chunk = pair.to_be_bytes();
     }
     output[n - 1] = last;
     Ok(())
+}
+
+/// Find the bigram holding position `pos`.
+///
+/// Starts from the lookup table and scans forward to the first range
+/// end past `pos`. The scan always stops: the last range ends at
+/// `n + 1`, past every position.
+///
+/// # Errors
+///
+/// Returns [`Error::BwtFailed`] when the scan runs past its table.
+#[inline]
+fn find_pair(end: &[u32], fast: &[u16], shift: usize, pos: usize) -> Result<u16> {
+    let mut pair = fast[pos >> shift];
+    while end[usize::from(pair)] as usize <= pos {
+        pair = pair.checked_add(1).ok_or(Error::BwtFailed)?;
+    }
+    Ok(pair)
 }
 
 #[cfg(test)]
@@ -702,15 +782,7 @@ fn sort_level<T: Symbol>(
 
     // Sort the LMS substrings: put each LMS position at the tail of
     // its bucket, then induce the L-type and S-type positions.
-    sa.fill(EMPTY);
-    find_bucket_tails(count, bucket);
-    for_each_lms(stype, |i| {
-        let key = text[i].bucket_index();
-        bucket[key] -= 1;
-        sa[bucket[key] as usize] = i as u32;
-    });
-    induce_l(text, count, bucket, sa);
-    induce_s(text, count, bucket, sa);
+    seed_lms_tails(text, stype, count, bucket, sa);
 
     // Move the sorted LMS positions to the front.
     let mut n1 = 0;
@@ -722,39 +794,12 @@ fn sort_level<T: Symbol>(
         }
     }
 
-    // Name the LMS substrings in sorted order. LMS positions are at
-    // least 2 apart and below `n - 1`, so `n1 + p / 2` is a unique
-    // slot below `n`. First store the length of each substring in its
-    // slot. A substring runs from its LMS position to the next LMS
-    // position, both included. The last substring reaches the virtual
-    // sentinel, so it is unique and gets length 0.
-    //
-    // Two substrings with equal length and equal symbols are equal:
-    // both end on an S-type position, and the type of each position
-    // follows from its symbol and the type after it. This replaces a
-    // walk over the type bits with one slice compare.
-    sa[n1..].fill(EMPTY);
-    let mut last_lms = None;
-    for_each_lms(stype, |i| {
-        if let Some(q) = last_lms {
-            sa[n1 + q / 2] = (i - q + 1) as u32;
-        }
-        last_lms = Some(i);
-    });
-    if let Some(q) = last_lms {
-        sa[n1 + q / 2] = 0;
-    }
-    let mut names = 0_u32;
-    let (mut prev, mut prev_len) = (0, 0);
-    for i in 0..n1 {
-        let p = sa[i] as usize;
-        let len = sa[n1 + p / 2] as usize;
-        if len == 0 || len != prev_len || text[p..p + len] != text[prev..prev + len] {
-            names += 1;
-        }
-        (prev, prev_len) = (p, len);
-        sa[n1 + p / 2] = names - 1;
-    }
+    // Name the LMS substrings in sorted order. Two substrings with
+    // equal length and equal symbols are equal: both end on an S-type
+    // position, and the type of each position follows from its symbol
+    // and the type after it. This replaces a walk over the type bits
+    // with one slice compare.
+    let names = name_lms_substrings(text, stype, sa, n1);
 
     // Move the names, in text order, to the reduced text `sa[n - n1..]`.
     // Each step writes below `next`, in a slot already read, and moves
@@ -793,6 +838,80 @@ fn sort_level<T: Symbol>(
 
     // Put the sorted LMS suffixes at their bucket tails, last first,
     // then induce the full order.
+    place_sorted_lms(text, count, bucket, sa, n1);
+    Ok(())
+}
+
+// Reason: `n` stays below 2^31, so every position fits `u32`.
+#[expect(clippy::cast_possible_truncation)]
+/// Seed the bucket tails with the LMS positions, then induce.
+///
+/// Puts each LMS position at the tail of its bucket, then induces the
+/// L-type and S-type positions: the first pass of each level.
+fn seed_lms_tails<T: Symbol>(
+    text: &[T],
+    stype: &[u64],
+    count: &[u32],
+    bucket: &mut [u32],
+    sa: &mut [u32],
+) {
+    sa.fill(EMPTY);
+    find_bucket_tails(count, bucket);
+    for_each_lms(stype, |i| {
+        let key = text[i].bucket_index();
+        bucket[key] -= 1;
+        sa[bucket[key] as usize] = i as u32;
+    });
+    induce_l(text, count, bucket, sa);
+    induce_s(text, count, bucket, sa);
+}
+
+// Reason: `n` stays below 2^31, so every position fits `u32`.
+#[expect(clippy::cast_possible_truncation)]
+/// Name the LMS substrings in sorted order and return the name count.
+///
+/// LMS positions are at least 2 apart and below `n - 1`, so `n1 + p / 2`
+/// is a unique slot below `n`. First stores the length of each substring
+/// in its slot. A substring runs from its LMS position to the next LMS
+/// position, both included. The last substring reaches the virtual
+/// sentinel, so it is unique and gets length 0.
+fn name_lms_substrings<T: Symbol>(text: &[T], stype: &[u64], sa: &mut [u32], n1: usize) -> u32 {
+    sa[n1..].fill(EMPTY);
+    let mut last_lms = None;
+    for_each_lms(stype, |i| {
+        if let Some(q) = last_lms {
+            sa[n1 + q / 2] = (i - q + 1) as u32;
+        }
+        last_lms = Some(i);
+    });
+    if let Some(q) = last_lms {
+        sa[n1 + q / 2] = 0;
+    }
+    let mut names = 0_u32;
+    let (mut prev, mut prev_len) = (0, 0);
+    for i in 0..n1 {
+        let p = sa[i] as usize;
+        let len = sa[n1 + p / 2] as usize;
+        if len == 0 || len != prev_len || text[p..p + len] != text[prev..prev + len] {
+            names += 1;
+        }
+        (prev, prev_len) = (p, len);
+        sa[n1 + p / 2] = names - 1;
+    }
+    names
+}
+
+/// Put the sorted LMS suffixes at their bucket tails, then induce.
+///
+/// Places the suffixes last first then induces the full L-type and
+/// S-type order.
+fn place_sorted_lms<T: Symbol>(
+    text: &[T],
+    count: &[u32],
+    bucket: &mut [u32],
+    sa: &mut [u32],
+    n1: usize,
+) {
     sa[n1..].fill(EMPTY);
     find_bucket_tails(count, bucket);
     for i in (0..n1).rev() {
@@ -804,7 +923,6 @@ fn sort_level<T: Symbol>(
     }
     induce_l(text, count, bucket, sa);
     induce_s(text, count, bucket, sa);
-    Ok(())
 }
 
 /// Mark the S-type positions of `text` in `stype`, one position at a time.

@@ -96,6 +96,7 @@ impl<W: Write> Encoder<W> {
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     pub fn new(inner: W, block_size: BlockSize) -> Result<Self> {
         Self::with_jobs(inner, block_size, Jobs::SERIAL)
     }
@@ -147,16 +148,19 @@ impl<W: Write> Encoder<W> {
     }
 
     /// Borrow the writer. It exists until `finish` takes it.
+    #[inline]
     const fn writer_ref(inner: Option<&W>) -> Option<&W> {
         inner
     }
 
     /// Borrow the writer mutably. It exists until `finish` takes it.
+    #[inline]
     const fn writer_mut(inner: Option<&mut W>) -> Option<&mut W> {
         inner
     }
 
     /// Take the writer out. It exists until `finish` takes it.
+    #[inline]
     const fn take_writer(&mut self) -> Option<W> {
         self.inner.take()
     }
@@ -166,6 +170,7 @@ impl<W: Write> Encoder<W> {
     /// The result is `Some` for every caller, because `finish` takes the
     /// encoder by value.
     #[must_use]
+    #[inline]
     pub const fn get_ref(&self) -> Option<&W> {
         Self::writer_ref(self.inner.as_ref())
     }
@@ -176,12 +181,14 @@ impl<W: Write> Encoder<W> {
     /// The result is `Some` for every caller, because `finish` takes the
     /// encoder by value.
     #[must_use]
+    #[inline]
     pub const fn get_mut(&mut self) -> Option<&mut W> {
         Self::writer_mut(self.inner.as_mut())
     }
 
     /// Return the configured block size.
     #[must_use]
+    #[inline]
     pub const fn block_size(&self) -> BlockSize {
         self.encoders.block_size()
     }
@@ -209,6 +216,7 @@ impl<W: Write> Encoder<W> {
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     pub fn finish(mut self) -> Result<W> {
         self.write_final_block()?;
         self.take_writer()
@@ -380,6 +388,7 @@ impl<W: Write> Decoder<W> {
     /// block for each thread, so its memory grows with the thread
     /// count.
     #[must_use]
+    #[inline]
     pub const fn with_jobs(inner: W, jobs: Jobs) -> Self {
         let mut decoder = Self::new(inner);
         decoder.jobs = jobs;
@@ -388,6 +397,7 @@ impl<W: Write> Decoder<W> {
 
     /// Return the wrapped writer.
     #[must_use]
+    #[inline]
     pub const fn get_ref(&self) -> &W {
         &self.inner
     }
@@ -396,6 +406,7 @@ impl<W: Write> Decoder<W> {
     ///
     /// A direct write to it puts foreign bytes in the stream.
     #[must_use]
+    #[inline]
     pub const fn get_mut(&mut self) -> &mut W {
         &mut self.inner
     }
@@ -424,6 +435,7 @@ impl<W: Write> Decoder<W> {
     /// # }
     /// ```
     #[must_use]
+    #[inline]
     pub fn block_size(&self) -> Option<BlockSize> {
         self.decoders.as_ref().map(DecoderSet::block_size)
     }

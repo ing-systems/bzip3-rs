@@ -256,6 +256,7 @@ impl StreamHeader {
     /// Returns [`Error::TruncatedHeader`] on a short header,
     /// [`Error::InvalidMagic`] on bad magic,
     /// [`Error::InvalidBlockSize`] on a block size outside the valid range.
+    #[inline]
     pub(crate) fn parse(data: &[u8]) -> Result<Self> {
         let Some(bytes) = data.first_chunk::<{ Self::LEN }>() else {
             return Err(Error::TruncatedHeader);
@@ -265,6 +266,7 @@ impl StreamHeader {
 }
 
 /// Read a block size field. Any invalid value fails with [`Error::InvalidBlockSize`].
+#[inline]
 fn block_size_from_field(bytes: &[u8]) -> Result<BlockSize> {
     let value = u32::try_from(read_i32(bytes)).map_err(|_| Error::InvalidBlockSize)?;
     BlockSize::new(value).map_err(|_| Error::InvalidBlockSize)
@@ -318,6 +320,7 @@ impl<'a> StreamBlocks<'a> {
 
     /// Return the block size from the stream header.
     #[must_use]
+    #[inline]
     pub const fn block_size(&self) -> BlockSize {
         self.block_size
     }
@@ -373,6 +376,7 @@ impl<'a> Iterator for StreamBlocks<'a> {
 /// Returns [`Error::InvalidHeader`] on bad sizes.
 /// Returns [`Error::TruncatedData`] on a short payload.
 /// Returns [`Error::InvalidBlockSize`] on an invalid header block size.
+#[inline]
 pub fn split_stream(data: &[u8]) -> Result<(BlockSize, Vec<FramedBlock<'_>>)> {
     let walk = StreamBlocks::new(data)?;
     let block_size = walk.block_size();
@@ -412,6 +416,7 @@ pub fn append_framed_block(
 }
 
 /// Copy the first four bytes of a slice. Panics on a shorter slice.
+#[inline]
 const fn first_four(bytes: &[u8]) -> [u8; 4] {
     [bytes[0], bytes[1], bytes[2], bytes[3]]
 }
@@ -421,6 +426,7 @@ const fn first_four(bytes: &[u8]) -> [u8; 4] {
 /// # Panics
 ///
 /// Panics when `bytes` holds fewer than four bytes.
+#[inline]
 pub const fn read_i32(bytes: &[u8]) -> i32 {
     i32::from_le_bytes(first_four(bytes))
 }
@@ -430,6 +436,7 @@ pub const fn read_i32(bytes: &[u8]) -> i32 {
 /// # Panics
 ///
 /// Panics when `bytes` holds fewer than four bytes.
+#[inline]
 pub const fn read_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(first_four(bytes))
 }

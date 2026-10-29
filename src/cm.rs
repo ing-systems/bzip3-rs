@@ -77,6 +77,59 @@ const fn fill_byte(offset: usize, filler: usize) -> Result<u8> {
     }
 }
 
+/// Mutable per-call state of the bit loops.
+///
+/// Bundles the range endpoints with the previous bytes and the run
+/// count, so the per-byte helpers take few arguments.
+#[derive(Debug)]
+struct BitCursor {
+    /// Low end of the current range.
+    low: u32,
+    /// High end of the current range.
+    high: u32,
+    /// Last coded byte.
+    prev_first: u8,
+    /// Byte before the last coded byte.
+    prev_second: u8,
+    /// Length of the current equal-byte run.
+    run: u32,
+}
+
+impl BitCursor {
+    /// Cursor for the canonical initial range with no history.
+    #[inline]
+    const fn fresh() -> Self {
+        Self {
+            low: 0,
+            high: 0xFFFF_FFFF,
+            prev_first: 0,
+            prev_second: 0,
+            run: 0,
+        }
+    }
+
+    /// Update the run count and return the mixer flag.
+    ///
+    /// The flag is set for a run above two, exactly as the per-byte
+    /// loop did inline.
+    #[inline]
+    fn flag(&mut self) -> usize {
+        if self.prev_first == self.prev_second {
+            self.run += 1;
+        } else {
+            self.run = 0;
+        }
+        usize::from(self.run > 2)
+    }
+
+    /// Move past one coded byte.
+    #[inline]
+    const fn advance(&mut self, byte: u8) {
+        self.prev_second = self.prev_first;
+        self.prev_first = byte;
+    }
+}
+
 impl CmCoder {
     /// Fresh state in canonical initial form.
     ///
@@ -115,51 +168,21 @@ impl CmCoder {
     /// reference block codec calls `begin` before every block.
     pub(crate) fn encode(&mut self, input: &[u8], output: &mut Vec<u8>) {
         self.reset();
-        let mut low = 0_u32;
-        let mut high = 0xFFFF_FFFF_u32;
-        let mut prev_first = 0_u8;
-        let mut prev_second = 0_u8;
-        let mut run = 0_u32;
+        let mut cursor = BitCursor::fresh();
         // Local buffer: a `Vec::push` in the bit loop adds a call
         // path that forces the loop state onto the stack.
         let mut out_buf = [0_u8; OUT_BUF_LEN];
         let mut used = 0_usize;
 
         for &byte in input {
-            if used > OUT_BUF_LEN - BYTE_OUT_MAX {
-                output.extend_from_slice(&out_buf[..used]);
-                used = 0;
-            }
-            if prev_first == prev_second {
-                run += 1;
-            } else {
-                run = 0;
-            }
-            let flag = usize::from(run > 2);
-
-            let mut context = 1_usize;
-            let mut bits = byte;
-            while context < 256 {
-                let (split, step) = self.predict(context, prev_first, prev_second, flag);
-                let mid = low.wrapping_add(scaled_width(low, high, split));
-                let bit = bits & 128 != 0;
-                // Branchless range select. Random input makes the
-                // bit unpredictable, so a branch mispredicts here.
-                let keep = u32::from(bit).wrapping_neg();
-                low = (low & keep) | (mid.wrapping_add(1) & !keep);
-                high = (mid & keep) | (high & !keep);
-                flush_shared_bytes(&mut low, &mut high, &mut out_buf, &mut used);
-                self.adapt(context, prev_first, flag, step, bit);
-                context = 2 * context + usize::from(bit);
-                bits <<= 1;
-            }
-
-            prev_second = prev_first;
-            prev_first = byte;
+            flush_full(output, &out_buf, &mut used);
+            let flag = cursor.flag();
+            self.encode_byte(byte, flag, &mut cursor, &mut out_buf, &mut used);
+            cursor.advance(byte);
         }
 
         output.extend_from_slice(&out_buf[..used]);
-        output.extend_from_slice(&low.to_be_bytes());
+        output.extend_from_slice(&cursor.low.to_be_bytes());
     }
 
     /// Decode exactly `output.len()` bytes from `input`.
@@ -176,8 +199,7 @@ impl CmCoder {
         // Single bounds-checked read per coded byte. `slice.get`
         // checks once; the filler path stays out of the hot loop.
         let mut pos = 0_usize;
-        let mut low = 0_u32;
-        let mut high = 0xFFFF_FFFF_u32;
+        let mut cursor = BitCursor::fresh();
         let mut code = 0_u32;
         for _ in 0..4 {
             let byte = next_byte(input, pos, filler)?;
@@ -185,74 +207,10 @@ impl CmCoder {
             code = (code << 8) | u32::from(byte);
         }
 
-        let mut prev_first = 0_u8;
-        let mut prev_second = 0_u8;
-        let mut run = 0_u32;
         for slot in output.iter_mut() {
-            if prev_first == prev_second {
-                run += 1;
-            } else {
-                run = 0;
-            }
-            let flag = usize::from(run > 2);
-
-            let mut context = 1_usize;
-            let mut current = self.predict(1, prev_first, prev_second, flag);
-            while context < 256 {
-                let (split, step) = current;
-                // Both child contexts use counters that the current
-                // bit does not change. Predict them now, so the
-                // loads and the mix run while the bit resolves.
-                let (zero, one) = if context < 128 {
-                    (
-                        self.predict(2 * context, prev_first, prev_second, flag),
-                        self.predict(2 * context + 1, prev_first, prev_second, flag),
-                    )
-                } else {
-                    ((0, 0), (0, 0))
-                };
-                let mid = low.wrapping_add(scaled_width(low, high, split));
-                let bit = code <= mid;
-                // Branchless range select. Random input makes the
-                // bit unpredictable, so a branch mispredicts here.
-                let keep = u32::from(bit).wrapping_neg();
-                let over = mid.wrapping_add(1);
-                low = (low & keep) | (over & !keep);
-                high = (mid & keep) | (high & !keep);
-                // The guard stays a branch: skewed input rarely passes it.
-                if (low ^ high) < (1 << 24) {
-                    if let Some(window) = input.get(pos..pos + 4) {
-                        // Fast path: read four bytes, keep the shared count.
-                        let count = shared_bytes(low, high);
-                        let shift = 8 * count;
-                        let next = u32::from_be_bytes([window[0], window[1], window[2], window[3]]);
-                        (low, high) = shift_range(low, high, shift);
-                        // Reason: the reference keeps only the low 32 bits.
-                        #[expect(clippy::cast_possible_truncation)]
-                        let merged =
-                            (u64::from(code) << shift | u64::from(next) >> (32 - shift)) as u32;
-                        code = merged;
-                        pos += count as usize;
-                    } else {
-                        (low, high, code, pos) =
-                            renormalize_tail(low, high, code, pos, input, filler)?;
-                    }
-                }
-                self.adapt(context, prev_first, flag, step, bit);
-                context = 2 * context + usize::from(bit);
-                let pick = usize::from(bit).wrapping_neg();
-                current = (
-                    (one.0 & keep) | (zero.0 & !keep),
-                    (one.1 & pick) | (zero.1 & !pick),
-                );
-            }
-
-            // Reason: the mask keeps 0..255, so the
-            // byte view matches the reference exactly.
-            #[expect(clippy::cast_possible_truncation)]
-            let byte = (context & 255) as u8;
-            prev_second = prev_first;
-            prev_first = byte;
+            let flag = cursor.flag();
+            let byte = self.decode_byte(input, filler, flag, &mut cursor, &mut code, &mut pos)?;
+            cursor.advance(byte);
             *slot = byte;
         }
         Ok(())
@@ -289,6 +247,96 @@ impl CmCoder {
         let mix = (point as u32) * 3 + estimate;
         // The mix stays below 2^18 by the counter bounds above.
         (mix, step)
+    }
+
+    /// Code one byte through its eight bit contexts.
+    ///
+    /// Runs the per-bit predict, range select, shared-byte flush, and
+    /// adapt steps. The caller leaves four spare bytes after `used`.
+    #[inline]
+    fn encode_byte(
+        &mut self,
+        byte: u8,
+        flag: usize,
+        cursor: &mut BitCursor,
+        out_buf: &mut [u8; OUT_BUF_LEN],
+        used: &mut usize,
+    ) {
+        let mut context = 1_usize;
+        let mut bits = byte;
+        while context < 256 {
+            let (split, step) =
+                self.predict(context, cursor.prev_first, cursor.prev_second, flag);
+            let mid = cursor.low.wrapping_add(scaled_width(cursor.low, cursor.high, split));
+            let bit = bits & 128 != 0;
+            // Branchless range select. Random input makes the
+            // bit unpredictable, so a branch mispredicts here.
+            let keep = u32::from(bit).wrapping_neg();
+            cursor.low = (cursor.low & keep) | (mid.wrapping_add(1) & !keep);
+            cursor.high = (mid & keep) | (cursor.high & !keep);
+            flush_shared_bytes(&mut cursor.low, &mut cursor.high, out_buf, used);
+            self.adapt(context, cursor.prev_first, flag, step, bit);
+            context = 2 * context + usize::from(bit);
+            bits <<= 1;
+        }
+    }
+
+    /// Decode one byte through its eight bit contexts.
+    ///
+    /// Predicts each bit, resolves it against `code`, renormalizes the
+    /// range, and adapts the tables. Returns the decoded byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TruncatedData`] when `input` and filler end.
+    #[inline]
+    fn decode_byte(
+        &mut self,
+        input: &[u8],
+        filler: usize,
+        flag: usize,
+        cursor: &mut BitCursor,
+        code: &mut u32,
+        pos: &mut usize,
+    ) -> Result<u8> {
+        let mut context = 1_usize;
+        let mut current = self.predict(1, cursor.prev_first, cursor.prev_second, flag);
+        while context < 256 {
+            let (split, step) = current;
+            // Both child contexts use counters that the current
+            // bit does not change. Predict them now, so the
+            // loads and the mix run while the bit resolves.
+            let (zero, one) = if context < 128 {
+                (
+                    self.predict(2 * context, cursor.prev_first, cursor.prev_second, flag),
+                    self.predict(2 * context + 1, cursor.prev_first, cursor.prev_second, flag),
+                )
+            } else {
+                ((0, 0), (0, 0))
+            };
+            let mid = cursor.low.wrapping_add(scaled_width(cursor.low, cursor.high, split));
+            let bit = *code <= mid;
+            // Branchless range select. Random input makes the
+            // bit unpredictable, so a branch mispredicts here.
+            let keep = u32::from(bit).wrapping_neg();
+            let over = mid.wrapping_add(1);
+            cursor.low = (cursor.low & keep) | (over & !keep);
+            cursor.high = (mid & keep) | (cursor.high & !keep);
+            renormalize_after_bit(input, filler, cursor, code, pos)?;
+            self.adapt(context, cursor.prev_first, flag, step, bit);
+            context = 2 * context + usize::from(bit);
+            let pick = usize::from(bit).wrapping_neg();
+            current = (
+                (one.0 & keep) | (zero.0 & !keep),
+                (one.1 & pick) | (zero.1 & !pick),
+            );
+        }
+
+        // Reason: the mask keeps 0..255, so the
+        // byte view matches the reference exactly.
+        #[expect(clippy::cast_possible_truncation)]
+        let byte = (context & 255) as u8;
+        Ok(byte)
     }
 
     /// Count one coded bit in the three counter tables.
@@ -356,6 +404,19 @@ const fn shift_range(low: u32, high: u32, shift: u32) -> (u32, u32) {
     (wide_low as u32, wide_high as u32)
 }
 
+/// Move the buffered bytes to `output` when fewer than one coded
+/// byte fits in the buffer.
+///
+/// One coded bit adds at most 4 bytes, so one byte adds at most
+/// [`BYTE_OUT_MAX`]. The caller runs this before each input byte.
+#[inline]
+fn flush_full(output: &mut Vec<u8>, out_buf: &[u8; OUT_BUF_LEN], used: &mut usize) {
+    if *used > OUT_BUF_LEN - BYTE_OUT_MAX {
+        output.extend_from_slice(&out_buf[..*used]);
+        *used = 0;
+    }
+}
+///
 /// Emit the leading bytes the range endpoints already agree on.
 ///
 /// Writes the four bytes of `low` and keeps only the shared ones.
@@ -374,6 +435,50 @@ fn flush_shared_bytes(
         *used += count as usize;
         (*low, *high) = shift_range(*low, *high, 8 * count);
     }
+}
+
+/// Shift the shared range bytes after one decode bit.
+///
+/// Fast path reads four bytes at once and keeps the shared count.
+/// Falls back to the tail reader at the end of `input` and in the
+/// filler.
+///
+/// # Errors
+///
+/// Returns [`Error::TruncatedData`] when `input` and filler end.
+#[inline]
+fn renormalize_after_bit(
+    input: &[u8],
+    filler: usize,
+    cursor: &mut BitCursor,
+    code: &mut u32,
+    pos: &mut usize,
+) -> Result<()> {
+    // The guard stays a branch: skewed input rarely passes it.
+    if (cursor.low ^ cursor.high) < (1 << 24) {
+        if let Some(window) = input.get(*pos..*pos + 4) {
+            // Fast path: read four bytes, keep the shared count.
+            let count = shared_bytes(cursor.low, cursor.high);
+            let shift = 8 * count;
+            let next = u32::from_be_bytes([window[0], window[1], window[2], window[3]]);
+            (cursor.low, cursor.high) = shift_range(cursor.low, cursor.high, shift);
+            // Reason: the reference keeps only the low 32 bits.
+            #[expect(clippy::cast_possible_truncation)]
+            let merged = (u64::from(*code) << shift | u64::from(next) >> (32 - shift)) as u32;
+            *code = merged;
+            *pos += count as usize;
+        } else {
+            (cursor.low, cursor.high, *code, *pos) = renormalize_tail(
+                cursor.low,
+                cursor.high,
+                *code,
+                *pos,
+                input,
+                filler,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Read coded bytes until the range endpoints differ in the top byte.

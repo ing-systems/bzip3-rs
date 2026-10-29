@@ -1,14 +1,4 @@
-//! Stateful block encoder for the bzip3 port.
-//!
-//! `BlockEncoder` owns all working memory sized from the block size at
-//! construction and reuses it across blocks. One call encodes one
-//! block through the full pipeline: checksum, run-length transform,
-//! Lempel-Ziv prediction, Burrows-Wheeler transform, then the
-//! order-0 context-mixing entropy coder. Model selection matches the
-//! reference exactly. Each of the first two stages applies only when
-//! it shrinks the block. Inputs below [`MIN_CODED_LEN`] bytes take the
-//! stored-raw layout: checksum, stored marker, raw bytes.
-//! Decoding enforces the reference check order, first failure wins.
+//! Inverse block decode pipeline with check order, fallback, and checksum last.
 
 use std::fmt::Debug;
 use std::fmt::Formatter;
@@ -24,360 +14,16 @@ use crate::frame::read_u32;
 use crate::lzp;
 use crate::rle;
 use crate::sais;
-use crate::sais::BwtScratch;
 use crate::sais::UnbwtScratch;
 
-/// Minimum input size that leaves the stored-raw route.
-///
-/// The reference takes the stored path when `data_size < 64`.
-pub const MIN_CODED_LEN: usize = 64;
-
-/// Marker stored in place of the BWT index for raw blocks.
-const STORED_MARKER: i32 = -1;
-
-/// Length of the stored prefix (CRC32 plus marker).
-const STORED_PREFIX_LEN: usize = 8;
-
-/// Largest raw body a stored block carries (`64` bytes).
-const STORED_MAX_BODY: usize = 64;
-
-/// Model byte of one coded block.
-///
-/// Bit `0x02` selects the LZP stage. Bit `0x04` selects the RLE
-/// stage. Other bits stay clear on encode. The decoder reads any
-/// wire value but only these bits select stages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Model(u8);
-
-impl Model {
-    /// Bit set when the LZP stage applies.
-    const LZP: u8 = 0x02;
-    /// Bit set when the RLE stage applies.
-    const RLE: u8 = 0x04;
-
-    /// True when the LZP stage applies.
-    const fn has_lzp(self) -> bool {
-        self.0 & Self::LZP != 0
-    }
-
-    /// True when the RLE stage applies.
-    const fn has_rle(self) -> bool {
-        self.0 & Self::RLE != 0
-    }
-
-    /// Mark the LZP stage as applied.
-    const fn set_lzp(&mut self) {
-        self.0 |= Self::LZP;
-    }
-
-    /// Mark the RLE stage as applied.
-    const fn set_rle(&mut self) {
-        self.0 |= Self::RLE;
-    }
-
-    /// Full header length: prefix, model byte, kept stage sizes.
-    const fn header_len(self) -> usize {
-        let mut len = PREFIX_LEN + MODEL_LEN;
-        if self.has_lzp() {
-            len += 4;
-        }
-        if self.has_rle() {
-            len += 4;
-        }
-        len
-    }
-}
-
-/// Prefix bytes before the model byte (CRC32 plus BWT index).
-const PREFIX_LEN: usize = 8;
-
-/// Maximum filler bytes appended on entropy-stream retry.
-///
-/// A short stream reads filler in the reference. Each output byte
-/// consumes at most 32 stream bytes in the pathological case. A retry
-/// with `min(32 * bwt_len + 64, FILLER_CAP)` filler matches the
-/// reference exactly on small blocks. It falls back in order on huge
-/// claims. The cap bounds time and memory on hostile inputs.
-const FILLER_CAP: usize = 1 << 20;
-
-/// Length of the model byte.
-const MODEL_LEN: usize = 1;
-
-/// Block encoder with constructor-owned working memory.
-///
-/// The two swap buffers each hold [`compress_bound`](crate::compress_bound) of the block
-/// size, so every intermediate stage result fits. The hash table and
-/// the entropy coder state persist across calls but reset per block,
-/// exactly like the reference. Slice-based calls borrow the input and
-/// return an owned payload.
-///
-/// # Examples
-///
-/// Build a streaming frame with one block, then decode it with
-/// [`stream::decompress`](crate::stream::decompress).
-///
-/// ```
-/// use bzip3_rs::{BlockEncoder, BlockHeader, BlockSize, Jobs, StreamHeader, stream};
-///
-/// # fn main() -> Result<(), bzip3_rs::error::Error> {
-/// let input = b"hello world ".repeat(1000);
-/// let size = BlockSize::MIN;
-///
-/// let mut encoder = BlockEncoder::new(size)?;
-/// let payload = encoder.encode_block(&input)?;
-///
-/// let mut frame = StreamHeader::new(size).to_bytes().to_vec();
-/// frame.extend_from_slice(&BlockHeader::for_block(payload.len(), input.len())?.to_bytes());
-/// frame.extend_from_slice(&payload);
-///
-/// let mut plain = Vec::new();
-/// stream::decompress(frame.as_slice(), &mut plain, Jobs::SERIAL)?;
-/// assert_eq!(plain, input);
-/// # Ok(())
-/// # }
-/// ```
-pub struct BlockEncoder {
-    /// Maximum input bytes accepted by [`BlockEncoder::encode_block`].
-    block_size: BlockSize,
-    /// First ping-pong stage buffer.
-    buf_a: Vec<u8>,
-    /// Second ping-pong stage buffer.
-    buf_b: Vec<u8>,
-    /// LZP hash table, cleared by the stage on every call.
-    lzp_table: Box<lzp::HashTable>,
-    /// Entropy coder state, reset by the stage on every call.
-    /// Boxed like the reference heap state, so the encoder struct
-    /// stays small on the stack.
-    coder: Box<CmCoder>,
-    /// Suffix sort scratch, kept between blocks.
-    bwt_scratch: BwtScratch,
-}
-
-impl Debug for BlockEncoder {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BlockEncoder")
-            .field("block_size", &self.block_size)
-            .finish_non_exhaustive()
-    }
-}
-
-impl BlockEncoder {
-    /// Build a block encoder for `block_size`, allocating working memory once.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::OutOfMemory`] when any working buffer allocation fails.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bzip3_rs::{BlockEncoder, BlockSize};
-    ///
-    /// # fn main() -> Result<(), bzip3_rs::error::Error> {
-    /// let encoder = BlockEncoder::new(BlockSize::MIN)?;
-    /// assert_eq!(encoder.block_size(), BlockSize::MIN);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn new(block_size: BlockSize) -> Result<Self> {
-        let capacity = crate::compress_bound(block_size.as_usize());
-        Ok(Self {
-            block_size,
-            buf_a: filled(capacity, 0).ok_or(Error::OutOfMemory)?,
-            buf_b: filled(capacity, 0).ok_or(Error::OutOfMemory)?,
-            lzp_table: lzp::new_table()?,
-            coder: Box::new(CmCoder::new()),
-            bwt_scratch: BwtScratch::default(),
-        })
-    }
-
-    /// Return the block size this block encoder was built for.
-    #[must_use]
-    #[inline]
-    pub const fn block_size(&self) -> BlockSize {
-        self.block_size
-    }
-
-    /// Encode one block into a new vector.
-    ///
-    /// Same output as [`BlockEncoder::encode_block_into`]. Use that call
-    /// to reuse one output vector across blocks.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`BlockEncoder::encode_block_into`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bzip3_rs::{BlockDecoder, BlockEncoder, BlockSize};
-    ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let data = b"hello world ".repeat(100);
-    /// let mut encoder = BlockEncoder::new(BlockSize::MIN)?;
-    /// let payload = encoder.encode_block(&data)?;
-    ///
-    /// let mut decoder = BlockDecoder::new(BlockSize::MIN)?;
-    /// assert_eq!(decoder.decode_block(&payload, u32::try_from(data.len())?)?, data);
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[must_use = "encode output must be written to the frame"]
-    #[inline]
-    pub fn encode_block(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        self.encode_block_into(data, &mut out)?;
-        Ok(out)
-    }
-
-    /// Encode one block through the full pipeline.
-    ///
-    /// Append the block to `out`. On an error, `out` keeps its length.
-    /// Inputs below 64 bytes take the stored-raw layout.
-    /// Larger inputs run RLE, then LZP, then BWT, then entropy coding,
-    /// with each of the first two stages kept only when it shrinks the
-    /// block. The header matches the reference byte for byte: CRC32,
-    /// BWT index, model byte, then the kept stage sizes in LZP, RLE
-    /// order, then the coded stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::BlockTooLarge`] when `data` exceeds the block size,
-    /// [`Error::OutOfMemory`] when the RLE stage cannot grow its output,
-    /// [`Error::BwtFailed`] when the transform fails.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bzip3_rs::{BlockEncoder, BlockSize};
-    ///
-    /// # fn main() -> Result<(), bzip3_rs::error::Error> {
-    /// let mut encoder = BlockEncoder::new(BlockSize::MIN)?;
-    /// let mut out = Vec::new();
-    /// for chunk in [b"first block ".repeat(50), b"second block ".repeat(50)] {
-    ///     out.clear(); // Reuse one vector for every block.
-    ///     encoder.encode_block_into(&chunk, &mut out)?;
-    ///     assert!(!out.is_empty());
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn encode_block_into(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<()> {
-        let limit = self.block_size.as_usize();
-        if data.len() > limit {
-            return Err(Error::BlockTooLarge);
-        }
-        if data.len() < MIN_CODED_LEN {
-            return encode_stored(data, out);
-        }
-        let crc = crc32::sum(1, data);
-        // Each kept stage output becomes the next stage input. The first
-        // stage reads `data`, so the input needs no copy. `src` names the
-        // buffer that holds the current stage output.
-        let mut src = StageBuffer::Input;
-        let mut cur_len = data.len();
-        let mut model = Model(0);
-        let mut lzp_size: u32 = 0;
-        let mut rle_size: u32 = 0;
-
-        // RLE forward transform, kept only when it shrinks the block.
-        let (input, stage_out, next) =
-            stage_buffers(src, cur_len, data, &mut self.buf_a, &mut self.buf_b);
-        if let Some(len) = rle::encode_into(input, stage_out) {
-            rle_size = u32::try_from(len).map_err(|_| Error::BlockTooLarge)?;
-            src = next;
-            cur_len = len;
-            model.set_rle();
-        }
-
-        // LZP forward transform, kept only when it shrinks the block.
-        // `None` is the reference `-1`: no saving, keep the input.
-        let (input, stage_out, next) =
-            stage_buffers(src, cur_len, data, &mut self.buf_a, &mut self.buf_b);
-        if let Some(len) = lzp::encode_into(input, stage_out, &mut self.lzp_table) {
-            lzp_size = u32::try_from(len).map_err(|_| Error::BlockTooLarge)?;
-            src = next;
-            cur_len = len;
-            model.set_lzp();
-        }
-
-        // Burrows-Wheeler transform into the free buffer.
-        let (input, bwt_out, _) =
-            stage_buffers(src, cur_len, data, &mut self.buf_a, &mut self.buf_b);
-        let bwt_idx = sais::bwt_with(input, bwt_out, &mut self.bwt_scratch)?;
-
-        // Write the header, then entropy-code the transform from the
-        // canonical start state straight after it.
-        out.try_reserve(model.header_len() + crate::compress_bound(cur_len))
-            .map_err(|_| Error::OutOfMemory)?;
-        out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&bwt_idx.to_le_bytes());
-        out.push(model.0);
-        if model.has_lzp() {
-            out.extend_from_slice(&lzp_size.to_le_bytes());
-        }
-        if model.has_rle() {
-            out.extend_from_slice(&rle_size.to_le_bytes());
-        }
-        self.coder.encode(&bwt_out[..cur_len], out);
-        Ok(())
-    }
-}
-
-/// Buffer that holds the current stage output.
-#[derive(Clone, Copy)]
-enum StageBuffer {
-    /// The caller block, not yet transformed.
-    Input,
-    /// The first stage buffer.
-    A,
-    /// The second stage buffer.
-    B,
-}
-
-/// Pick the input slice of the next stage and its free output buffer.
-///
-/// Return the buffer tag of that output too. The output never aliases
-/// the input.
-fn stage_buffers<'a>(
-    src: StageBuffer,
-    len: usize,
-    data: &'a [u8],
-    a: &'a mut [u8],
-    b: &'a mut [u8],
-) -> (&'a [u8], &'a mut [u8], StageBuffer) {
-    match src {
-        StageBuffer::Input => (data, a, StageBuffer::A),
-        StageBuffer::A => (&a[..len], b, StageBuffer::B),
-        StageBuffer::B => (&b[..len], a, StageBuffer::A),
-    }
-}
-
-/// Encode one block through the stored-raw layout.
-///
-/// The caller routes inputs below [`MIN_CODED_LEN`] bytes here.
-/// Append the block to `out`.
-fn encode_stored(data: &[u8], out: &mut Vec<u8>) -> Result<()> {
-    out.try_reserve(data.len() + STORED_PREFIX_LEN)
-        .map_err(|_| Error::OutOfMemory)?;
-    out.extend_from_slice(&crc32::sum(1, data).to_le_bytes());
-    out.extend_from_slice(&STORED_MARKER.to_le_bytes());
-    out.extend_from_slice(data);
-    Ok(())
-}
-
-/// Fields read from the fixed prefix of one block payload.
-#[derive(Debug, Clone, Copy)]
-struct PayloadPrefix {
-    /// Claimed original size, at most the block size.
-    original_len: usize,
-    /// CRC32 stored in the payload.
-    crc: u32,
-    /// BWT index, or [`STORED_MARKER`] for a raw block.
-    bwt_index: i32,
-    /// Bound of the block size, the decode buffer size.
-    limit: usize,
-}
+use super::FILLER_CAP;
+use super::MODEL_LEN;
+use super::PREFIX_LEN;
+use super::PayloadPrefix;
+use super::STORED_MARKER;
+use super::STORED_MAX_BODY;
+use super::STORED_PREFIX_LEN;
+use super::model::Model;
 
 /// State of the bytes that [`BlockDecoder::recover_block_into`] appended.
 #[derive(Debug)]
@@ -392,7 +38,7 @@ pub enum BlockStatus {
 
 /// Block decoder with constructor-owned working memory.
 ///
-/// This type mirrors [`BlockEncoder`] on the decode side and never touches
+/// This type mirrors [`BlockEncoder`](super::BlockEncoder) on the decode side and never touches
 /// the encoder. The hash table and the entropy coder state persist
 /// across calls but reset per block, exactly like the reference. One
 /// call decodes one block payload through the inverse pipeline:
@@ -716,6 +362,7 @@ impl BlockDecoder {
     }
 
     /// Decode a payload that passed [`BlockDecoder::read_prefix`].
+    #[inline]
     fn decode_payload(
         &mut self,
         payload: &[u8],
@@ -729,6 +376,7 @@ impl BlockDecoder {
     /// Decode a payload through every stage, without the checksum.
     ///
     /// `out` holds the full block when this call succeeds.
+    #[inline]
     fn decode_body(&mut self, payload: &[u8], head: &PayloadPrefix, out: &mut [u8]) -> Result<()> {
         if head.bwt_index == STORED_MARKER {
             return decode_stored(payload, head, out);
@@ -871,6 +519,7 @@ impl BlockDecoder {
 /// # Errors
 ///
 /// Returns [`Error::ChecksumMismatch`] when the sums differ.
+#[inline]
 fn check_crc(plain: &[u8], head: &PayloadPrefix) -> Result<()> {
     if crc32::sum(1, plain) == head.crc {
         Ok(())
@@ -884,6 +533,7 @@ fn check_crc(plain: &[u8], head: &PayloadPrefix) -> Result<()> {
 /// # Errors
 ///
 /// Returns [`Error::InvalidHeader`] when the size is outside `0..=limit`.
+#[inline]
 fn read_stage_size(bytes: &[u8], limit: usize) -> Result<usize> {
     usize::try_from(read_i32(bytes))
         .ok()
@@ -895,6 +545,7 @@ fn read_stage_size(bytes: &[u8], limit: usize) -> Result<usize> {
 ///
 /// The body must hold exactly `orig` bytes within the 64-byte small
 /// block bound. The caller checks the checksum, so size faults win over it.
+#[inline]
 fn decode_stored(payload: &[u8], head: &PayloadPrefix, out: &mut [u8]) -> Result<()> {
     let original_len = head.original_len;
     let Some(body) = payload.get(STORED_PREFIX_LEN..) else {
@@ -910,10 +561,10 @@ fn decode_stored(payload: &[u8], head: &PayloadPrefix, out: &mut [u8]) -> Result
 #[cfg(test)]
 mod tests {
     use super::BlockDecoder;
-    use super::BlockEncoder;
     use super::BlockStatus;
-    use super::MIN_CODED_LEN;
+    use super::decode_stored;
     use crate::BlockSize;
+    use crate::block::BlockEncoder;
     use crate::compress_bound;
     use crate::error::Error;
 
@@ -925,93 +576,6 @@ mod tests {
     /// Smallest state used by the tests (65 KiB block).
     fn small_state() -> BlockEncoder {
         BlockEncoder::new(BlockSize::MIN).unwrap()
-    }
-
-    #[test]
-    fn stored_layout_matches_reference() {
-        let out = small_state().encode_block(b"A").unwrap();
-        assert_eq!(out.len(), 9);
-        assert_eq!(
-            u32::from_le_bytes(out[..4].try_into().unwrap()),
-            0x417B_1DBC
-        );
-        assert_eq!(out[4..8], [0xFF; 4]);
-        assert_eq!(out[8..], [b'A']);
-    }
-
-    #[test]
-    fn small_block_boundary_routes_stored_vs_coded() {
-        let mut state = small_state();
-        for len in 0..MIN_CODED_LEN {
-            let out = state.encode_block(&vec![b'q'; len]).unwrap();
-            assert_eq!(out.len(), len + 8, "stored len {len}");
-            assert_eq!(out[4..8], [0xFF; 4], "stored marker len {len}");
-        }
-        // `MIN_CODED_LEN` itself leaves the stored route: the RLE stage
-        // collapses the run, so a model byte replaces the raw layout.
-        let out = state.encode_block(&[b'q'; MIN_CODED_LEN]).unwrap();
-        assert_eq!(out[8], 0x04, "RLE-only model {}", out[8]);
-        assert_ne!(out[4..8], [0xFF; 4]);
-    }
-
-    #[test]
-    fn oversize_input_fails_data_too_big() {
-        let mut state = small_state();
-        let big = vec![0_u8; usize::try_from(BlockSize::MIN.get()).unwrap() + 1];
-        assert!(matches!(
-            state.encode_block(&big),
-            Err(crate::error::Error::BlockTooLarge)
-        ));
-    }
-
-    #[test]
-    fn repeated_bytes_set_rle_model_bit() {
-        let mut state = small_state();
-        let out = state.encode_block(&[b'A'; 1000]).unwrap();
-        assert_eq!(out[8] & 0x04, 0x04, "RLE bit set, model {}", out[8]);
-    }
-
-    #[test]
-    fn periodic_text_sets_lzp_without_rle() {
-        // A long-period repeat compresses via LZP but has no runs for RLE.
-        let phrase: Vec<u8> = (0..50_u8).collect();
-        let mut input = Vec::new();
-        for _ in 0..4 {
-            input.extend_from_slice(&phrase);
-        }
-        assert!(input.len() >= 72);
-        let out = small_state().encode_block(&input).unwrap();
-        assert_eq!(out[8] & 0x06, 0x02, "LZP-only model {}", out[8]);
-    }
-
-    #[test]
-    fn random_bytes_take_plain_coded_path() {
-        // Fixed-seed filler with no runs and no long matches.
-        let mut seed = 0x00C0_FFEE_u32;
-        let input: Vec<u8> = (0..1000)
-            .map(|_| {
-                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                u8::try_from((seed >> 16) & 0xFF).expect("masked byte fits")
-            })
-            .collect();
-        let out = small_state().encode_block(&input).unwrap();
-        assert_eq!(out[8], 0, "plain model {}", out[8]);
-        // Model zero means no size fields: the coded stream starts at 9.
-        assert!(out.len() > 9);
-    }
-
-    #[test]
-    fn state_reuse_gives_identical_bytes() {
-        let mut state = small_state();
-        let first = state.encode_block(&[b'A'; 1000]).unwrap();
-        let _ = state.encode_block(&[b'B'; 500]).unwrap();
-        let again = state.encode_block(&[b'A'; 1000]).unwrap();
-        assert_eq!(first, again);
-    }
-
-    #[test]
-    fn block_size_accessor_matches_constructor() {
-        assert_eq!(small_state().block_size(), BlockSize::MIN);
     }
 
     #[test]
@@ -1306,7 +870,7 @@ mod tests {
     fn stored_prefix_short_fails_truncated_header() {
         // `read_prefix` always passes at least 8 bytes, so this arm runs
         // only through a direct call.
-        let head = super::PayloadPrefix {
+        let head = crate::block::PayloadPrefix {
             original_len: 4,
             crc: 0,
             bwt_index: -1,
@@ -1314,7 +878,7 @@ mod tests {
         };
         let mut out = [0_u8; 4];
         assert!(matches!(
-            super::decode_stored(&[0_u8; 4], &head, &mut out),
+            decode_stored(&[0_u8; 4], &head, &mut out),
             Err(Error::TruncatedHeader)
         ));
     }

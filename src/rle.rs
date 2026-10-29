@@ -111,12 +111,7 @@ fn encode_runs(input: &[u8], gain: &[i64; 256], out: &mut [u8], limit: usize) ->
     if limit <= BITMAP_LEN {
         return None;
     }
-    for (slot, chunk) in out.iter_mut().zip(gain.as_chunks::<8>().0) {
-        *slot = chunk
-            .iter()
-            .enumerate()
-            .fold(0_u8, |acc, (bit, &g)| acc | (u8::from(g > 0) << bit));
-    }
+    write_bitmap(out, gain);
     let collapse = ByteSet::new(gain.map(|g| g > 0));
     let mut pos = BITMAP_LEN;
     let mut start = 0;
@@ -136,17 +131,40 @@ fn encode_runs(input: &[u8], gain: &[i64; 256], out: &mut [u8], limit: usize) ->
         // The value, then `repeats / 255` full count bytes, then the rest.
         let len = run_len(&input[start..]);
         let repeats = len - 1;
-        let full = repeats / 255;
-        if pos + full + 2 >= limit {
+        if pos + repeats / 255 + 2 >= limit {
             return None;
         }
-        out[pos] = input[start];
-        out[pos + 1..pos + 1 + full].fill(255);
-        out[pos + 1 + full] = u8::try_from(repeats % 255).unwrap_or(u8::MAX);
-        pos += full + 2;
+        pos = emit_run(out, pos, input[start], repeats);
         start += len;
     }
     Some(pos)
+}
+
+/// Write the 32-byte collapse bitmap of `gain` at the start of `out`.
+///
+/// `out` holds at least [`BITMAP_LEN`] bytes: the caller checks the
+/// limit before this runs.
+#[inline]
+fn write_bitmap(out: &mut [u8], gain: &[i64; 256]) {
+    for (slot, chunk) in out.iter_mut().zip(gain.as_chunks::<8>().0) {
+        *slot = chunk
+            .iter()
+            .enumerate()
+            .fold(0_u8, |acc, (bit, &g)| acc | (u8::from(g > 0) << bit));
+    }
+}
+
+/// Append one collapsed run of `value` with `repeats` extra bytes.
+///
+/// Writes the value, then `repeats / 255` full count bytes, then the
+/// rest. Returns the position after the run. The caller checks room.
+#[inline]
+fn emit_run(out: &mut [u8], pos: usize, value: u8, repeats: usize) -> usize {
+    let full = repeats / 255;
+    out[pos] = value;
+    out[pos + 1..pos + 1 + full].fill(255);
+    out[pos + 1 + full] = u8::try_from(repeats % 255).unwrap_or(u8::MAX);
+    pos + full + 2
 }
 
 /// Run the inverse run-length transform into a new vector.
@@ -183,14 +201,7 @@ pub fn decode_into(input: &[u8], out: &mut [u8]) -> Result<()> {
         return Err(Error::CorruptStageData);
     }
     let out_len = out.len();
-    let mut gain = [false; 256];
-    for (chunk, &byte) in input.iter().take(32).enumerate() {
-        for bit in 0..8_usize {
-            gain[chunk * 8 + bit] = (byte >> bit) & 1 == 1;
-        }
-    }
-
-    let collapse = ByteSet::new(gain);
+    let collapse = ByteSet::new(parse_bitmap(input));
     let mut op: usize = 0;
     let mut ip: usize = 32;
     while op < out_len && ip < input.len() {
@@ -205,21 +216,7 @@ pub fn decode_into(input: &[u8], out: &mut [u8]) -> Result<()> {
         }
         let byte = input[ip];
         ip += 1;
-        let mut run: usize = 1;
-        loop {
-            let Some(&count) = input.get(ip) else {
-                return Err(Error::CorruptStageData);
-            };
-            ip += 1;
-            // The reference stops adding past `out_len`
-            // but still reads count bytes to the end.
-            if run <= out_len {
-                run += usize::from(count);
-            }
-            if count != 255 {
-                break;
-            }
-        }
+        let run = read_run_count(input, &mut ip, out_len)?;
         // The reference caps the fill at `out_len` and drops the rest.
         let fill = run.min(out_len - op);
         out[op..op + fill].fill(byte);
@@ -229,6 +226,50 @@ pub fn decode_into(input: &[u8], out: &mut [u8]) -> Result<()> {
         return Err(Error::CorruptStageData);
     }
     Ok(())
+}
+
+/// Read the 32-byte collapse bitmap at the start of `input`.
+///
+/// `input` holds at least 32 bytes: the caller checks this first.
+#[inline]
+fn parse_bitmap(input: &[u8]) -> [bool; 256] {
+    let mut gain = [false; 256];
+    for (chunk, &byte) in input.iter().take(32).enumerate() {
+        for bit in 0..8_usize {
+            gain[chunk * 8 + bit] = (byte >> bit) & 1 == 1;
+        }
+    }
+    gain
+}
+
+/// Read the count bytes of one collapsed run.
+///
+/// Advances `ip` past the terminator. The total stops growing past
+/// `out_len`, but the read still consumes every count byte, as the
+/// reference does.
+///
+/// # Errors
+///
+/// Returns [`Error::CorruptStageData`] when the payload ends inside
+/// the run.
+#[inline]
+fn read_run_count(input: &[u8], ip: &mut usize, out_len: usize) -> Result<usize> {
+    let mut run: usize = 1;
+    loop {
+        let Some(&count) = input.get(*ip) else {
+            return Err(Error::CorruptStageData);
+        };
+        *ip += 1;
+        // The reference stops adding past `out_len`
+        // but still reads count bytes to the end.
+        if run <= out_len {
+            run += usize::from(count);
+        }
+        if count != 255 {
+            break;
+        }
+    }
+    Ok(run)
 }
 
 /// Set of byte values with a fast search for the first member.

@@ -108,6 +108,7 @@ impl<R: Read> Encoder<R> {
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     pub fn new(inner: R, block_size: BlockSize) -> Result<Self> {
         Self::with_jobs(inner, block_size, Jobs::SERIAL)
     }
@@ -161,6 +162,7 @@ impl<R: Read> Encoder<R> {
 
     /// Return the wrapped reader.
     #[must_use]
+    #[inline]
     pub const fn get_ref(&self) -> &R {
         &self.inner
     }
@@ -169,6 +171,7 @@ impl<R: Read> Encoder<R> {
     ///
     /// A direct read from it moves the source and corrupts the stream.
     #[must_use]
+    #[inline]
     pub const fn get_mut(&mut self) -> &mut R {
         &mut self.inner
     }
@@ -178,12 +181,14 @@ impl<R: Read> Encoder<R> {
     /// The encoder loses the plain bytes that it read but did not code yet.
     /// It also loses the framed bytes that the caller did not read yet.
     #[must_use]
+    #[inline]
     pub fn into_inner(self) -> R {
         self.inner
     }
 
     /// Return the configured block size.
     #[must_use]
+    #[inline]
     pub const fn block_size(&self) -> BlockSize {
         self.encoders.block_size()
     }
@@ -237,6 +242,7 @@ impl<R: Read> Read for Encoder<R> {
 /// # Errors
 ///
 /// Returns [`Error::Io`] when the read fails.
+#[inline]
 fn read_to_len<R: Read>(inner: &mut R, tail: &mut Vec<u8>, len: usize) -> Result<bool> {
     let missing = len.saturating_sub(tail.len());
     inner.take(missing as u64).read_to_end(tail)?;
@@ -419,6 +425,7 @@ impl<R: Read> Decoder<R> {
     /// let result = Decoder::new(Cursor::new([0_u8; 9]));
     /// assert!(matches!(result, Err(Error::InvalidMagic)));
     /// ```
+    #[inline]
     pub fn new(inner: R) -> Result<Self> {
         Self::with_jobs(inner, Jobs::SERIAL)
     }
@@ -484,6 +491,7 @@ impl<R: Read> Decoder<R> {
 
     /// Return the wrapped reader.
     #[must_use]
+    #[inline]
     pub const fn get_ref(&self) -> &R {
         &self.inner
     }
@@ -492,6 +500,7 @@ impl<R: Read> Decoder<R> {
     ///
     /// A direct read from it moves the source and corrupts the stream.
     #[must_use]
+    #[inline]
     pub const fn get_mut(&mut self) -> &mut R {
         &mut self.inner
     }
@@ -501,12 +510,14 @@ impl<R: Read> Decoder<R> {
     /// The decoder loses the framed bytes that it read but did not decode yet.
     /// It also loses the plain bytes that the caller did not read yet.
     #[must_use]
+    #[inline]
     pub fn into_inner(self) -> R {
         self.inner
     }
 
     /// Return the block size from the frame header.
     #[must_use]
+    #[inline]
     pub const fn block_size(&self) -> BlockSize {
         self.decoders.block_size()
     }

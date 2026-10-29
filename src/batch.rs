@@ -46,6 +46,7 @@ pub fn build_pool(jobs: Jobs) -> Result<(Option<ThreadPool>, usize)> {
 }
 
 /// Run `work` on the private pool, or on the current pool when `pool` is empty.
+#[inline]
 pub fn run_on<T: Send>(pool: Option<&ThreadPool>, work: impl FnOnce() -> T + Send) -> T {
     match pool {
         Some(pool) => pool.install(work),
@@ -92,11 +93,13 @@ impl EncodeBatch {
     }
 
     /// Return the block size of every state.
+    #[inline]
     pub const fn block_size(&self) -> BlockSize {
         self.block_size
     }
 
     /// Return the most plain bytes that one `encode` call takes.
+    #[inline]
     pub const fn input_len(&self) -> usize {
         let width = self.block_size.as_usize();
         width.saturating_mul(self.workers)
@@ -139,6 +142,7 @@ impl EncodeBatch {
     /// # Errors
     ///
     /// Returns the codec fault of that block.
+    #[inline]
     fn take_block_bytes(&mut self, index: usize) -> Result<&[u8]> {
         let slot = &mut self.slots[index];
         std::mem::replace(&mut slot.result, Ok(()))?;
@@ -205,6 +209,7 @@ impl EncoderSet {
     }
 
     /// Return the block size of the states.
+    #[inline]
     pub const fn block_size(&self) -> BlockSize {
         match self {
             Self::Serial { state, .. } => state.block_size(),
@@ -216,6 +221,7 @@ impl EncoderSet {
     ///
     /// This is one block in the serial mode and one block for each
     /// worker in the parallel mode.
+    #[inline]
     pub const fn input_len(&self) -> usize {
         match self {
             Self::Serial { state, .. } => state.block_size().as_usize(),
@@ -245,6 +251,7 @@ impl EncoderSet {
     /// # Errors
     ///
     /// Returns the codec fault of the first failing block.
+    #[inline]
     pub fn append_to(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<()> {
         match self {
             Self::Serial { state, .. } => append_framed_block(state, data, out),
@@ -299,11 +306,13 @@ impl DecodeBatch {
     }
 
     /// Return the block size of every state.
+    #[inline]
     pub const fn block_size(&self) -> BlockSize {
         self.block_size
     }
 
     /// Return the most blocks that one batch takes.
+    #[inline]
     pub const fn max_blocks(&self) -> usize {
         self.workers
     }
@@ -357,6 +366,7 @@ impl DecodeBatch {
     }
 
     /// Return the count of queued blocks.
+    #[inline]
     pub const fn queued(&self) -> usize {
         self.queued
     }
@@ -377,11 +387,13 @@ impl DecodeBatch {
     }
 
     /// Return the start offset of queued block `index` in the tail.
+    #[inline]
     pub fn block_start(&self, index: usize) -> usize {
         self.slots[index].range.start - BlockHeader::LEN
     }
 
     /// Return the end offset of queued block `index` in the tail.
+    #[inline]
     pub fn block_end(&self, index: usize) -> usize {
         self.slots[index].range.end
     }
@@ -391,6 +403,7 @@ impl DecodeBatch {
     /// # Errors
     ///
     /// Returns the codec fault of that block.
+    #[inline]
     pub fn take_plain(&mut self, index: usize) -> Result<&[u8]> {
         let slot = &mut self.slots[index];
         std::mem::replace(&mut slot.result, Ok(()))?;
@@ -455,6 +468,7 @@ impl DecoderSet {
     }
 
     /// Return the block size of the states.
+    #[inline]
     pub const fn block_size(&self) -> BlockSize {
         match self {
             Self::Serial(decoder) => decoder.block_size(),

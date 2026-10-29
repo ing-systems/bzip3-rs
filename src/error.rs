@@ -74,6 +74,7 @@ impl Error {
     /// unchanged. Codec faults become invalid-data errors that keep the
     /// original [`Error`] as their source.
     #[must_use]
+    #[inline]
     pub(crate) fn into_io(self) -> io::Error {
         match self {
             Self::Io(e) => e,

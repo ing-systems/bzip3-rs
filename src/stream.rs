@@ -36,6 +36,7 @@ use crate::frame::split_stream;
 /// # Errors
 ///
 /// Returns [`Error::Io`] when the read fails.
+#[inline]
 fn read_fully<R: Read>(mut source: R) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     source.read_to_end(&mut buf)?;
@@ -49,6 +50,7 @@ fn read_fully<R: Read>(mut source: R) -> Result<Vec<u8>> {
 /// # Errors
 ///
 /// Returns [`Error::Io`] when the read fails.
+#[inline]
 fn read_chunk<R: Read>(source: &mut R, width: usize, buf: &mut Vec<u8>) -> Result<()> {
     buf.clear();
     source.take(width as u64).read_to_end(buf)?;
@@ -60,6 +62,7 @@ fn read_chunk<R: Read>(source: &mut R, width: usize, buf: &mut Vec<u8>) -> Resul
 /// # Errors
 ///
 /// Returns [`Error::Io`] when the write fails.
+#[inline]
 fn write_counted<W: Write>(dest: &mut W, bytes: &[u8]) -> Result<u64> {
     dest.write_all(bytes)?;
     Ok(bytes.len() as u64)
@@ -104,12 +107,39 @@ pub(crate) fn encode_blocks(data: &[u8], block_size: BlockSize) -> Result<Vec<Ve
     let chunks: Vec<&[u8]> = data.chunks(width).collect();
     // One block needs no pool, so it runs on the caller thread.
     if chunks.len() < 2 {
-        let mut state = BlockEncoder::new(block_size)?;
-        return chunks
-            .iter()
-            .map(|chunk| encode_one(&mut state, chunk))
-            .collect();
+        encode_blocks_serial(&chunks, block_size)
+    } else {
+        encode_blocks_parallel(&chunks, block_size)
     }
+}
+
+/// Encode each chunk on the caller thread with one reused state.
+///
+/// # Errors
+///
+/// Returns the codec fault of the first failing block in block order,
+/// [`Error::OutOfMemory`] when a state or output allocation fails.
+fn encode_blocks_serial(chunks: &[&[u8]], block_size: BlockSize) -> Result<Vec<Vec<u8>>> {
+    let mut state = BlockEncoder::new(block_size)?;
+    chunks
+        .iter()
+        .map(|chunk| encode_one(&mut state, chunk))
+        .collect()
+}
+
+/// Encode each chunk range on the current pool with worker-local states.
+///
+/// Each worker owns one state built on the worker itself, so workers
+/// share no lock and no state crosses threads. Each output holds one
+/// block header plus payload. Workers take whole ranges, so uneven
+/// blocks keep all workers busy. The outputs join in order, so the
+/// bytes match the serial path.
+///
+/// # Errors
+///
+/// Returns the codec fault of the first failing block in block order,
+/// [`Error::OutOfMemory`] when a state or output allocation fails.
+fn encode_blocks_parallel(chunks: &[&[u8]], block_size: BlockSize) -> Result<Vec<Vec<u8>>> {
     let ranges = partition(chunks.len(), rayon::current_num_threads().max(1));
     // One state for each worker, built on the worker itself: no shared
     // lock, and the builds run together instead of stalling the caller.
@@ -147,23 +177,41 @@ pub(crate) fn encode_blocks(data: &[u8], block_size: BlockSize) -> Result<Vec<Ve
 pub(crate) fn decode_blocks(blocks: &[FramedBlock<'_>], block_size: BlockSize) -> Result<Vec<u8>> {
     // One block needs no pool, so it runs on the caller thread.
     if blocks.len() < 2 {
-        let mut decoder = BlockDecoder::new(block_size)?;
-        let mut out = Vec::new();
-        for block in blocks {
-            decoder.decode_block_into(block.payload, block.header.original_size, &mut out)?;
-        }
-        return Ok(out);
+        decode_blocks_serial(blocks, block_size)
+    } else {
+        decode_blocks_parallel(blocks, block_size)
     }
-    let mut offsets = Vec::with_capacity(blocks.len() + 1);
-    offsets.push(0_usize);
+}
+
+/// Decode each block on the caller thread into one plain vector.
+///
+/// # Errors
+///
+/// Returns the codec fault of the first failing block in block order,
+/// [`Error::OutOfMemory`] when a state or the output allocation fails.
+fn decode_blocks_serial(blocks: &[FramedBlock<'_>], block_size: BlockSize) -> Result<Vec<u8>> {
+    let mut decoder = BlockDecoder::new(block_size)?;
+    let mut out = Vec::new();
     for block in blocks {
-        let len = usize::try_from(block.header.original_size).map_err(|_| Error::OutOfMemory)?;
-        offsets.push(
-            offsets[offsets.len() - 1]
-                .checked_add(len)
-                .ok_or(Error::OutOfMemory)?,
-        );
+        decoder.decode_block_into(block.payload, block.header.original_size, &mut out)?;
     }
+    Ok(out)
+}
+
+/// Decode each block range on the current pool into disjoint slices.
+///
+/// The total plain size comes from the walked headers, so one output
+/// vector holds every block. Each worker owns one state built on the
+/// worker itself and decodes its ranges straight into disjoint output
+/// slices: no shared lock, no per-block allocation, no extra copy.
+/// The outputs join in order, so the bytes match the serial path.
+///
+/// # Errors
+///
+/// Returns the codec fault of the first failing block in block order,
+/// [`Error::OutOfMemory`] when a state or the output allocation fails.
+fn decode_blocks_parallel(blocks: &[FramedBlock<'_>], block_size: BlockSize) -> Result<Vec<u8>> {
+    let offsets = block_end_offsets(blocks)?;
     let total = offsets[offsets.len() - 1];
     let mut out = filled(total, 0).ok_or(Error::OutOfMemory)?;
     let ranges = partition(blocks.len(), rayon::current_num_threads().max(1));
@@ -199,6 +247,25 @@ pub(crate) fn decode_blocks(blocks: &[FramedBlock<'_>], block_size: BlockSize) -
         })
         .collect::<Result<Vec<()>>>()?;
     Ok(out)
+}
+
+/// Walk the block headers into end offsets starting at 0.
+///
+/// # Errors
+///
+/// Returns [`Error::OutOfMemory`] when a size does not fit.
+fn block_end_offsets(blocks: &[FramedBlock<'_>]) -> Result<Vec<usize>> {
+    let mut offsets = Vec::with_capacity(blocks.len() + 1);
+    offsets.push(0_usize);
+    for block in blocks {
+        let len = usize::try_from(block.header.original_size).map_err(|_| Error::OutOfMemory)?;
+        offsets.push(
+            offsets[offsets.len() - 1]
+                .checked_add(len)
+                .ok_or(Error::OutOfMemory)?,
+        );
+    }
+    Ok(offsets)
 }
 
 /// Run `work` on the pool that `jobs` selects.
@@ -277,21 +344,42 @@ pub fn compress<R: Read, W: Write>(
     };
     let mut total = write_counted(&mut writer, &StreamHeader::new(block_size).to_bytes())?;
     if let Some(state) = state.as_mut() {
-        let mut block_bytes = Vec::new();
-        loop {
-            block_bytes.clear();
-            append_framed_block(state, &chunk, &mut block_bytes)?;
-            total += write_counted(&mut writer, &block_bytes)?;
-            if chunk.len() < width {
-                break;
-            }
-            read_chunk(&mut reader, width, &mut chunk)?;
-            if chunk.is_empty() {
-                break;
-            }
-        }
+        total += pump_reader_blocks(&mut reader, &mut writer, state, chunk, width)?;
     }
     writer.flush()?;
+    Ok(total)
+}
+
+/// Read blocks from `reader` and write each framed block at once.
+///
+/// `chunk` holds the first block already read. Returns the framed
+/// bytes written after the header.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the read fails, otherwise the errors
+/// of [`compress_slice`].
+fn pump_reader_blocks<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    state: &mut BlockEncoder,
+    mut chunk: Vec<u8>,
+    width: usize,
+) -> Result<u64> {
+    let mut total = 0;
+    let mut block_bytes = Vec::new();
+    loop {
+        block_bytes.clear();
+        append_framed_block(state, &chunk, &mut block_bytes)?;
+        total += write_counted(&mut *writer, &block_bytes)?;
+        if chunk.len() < width {
+            break;
+        }
+        read_chunk(reader, width, &mut chunk)?;
+        if chunk.is_empty() {
+            break;
+        }
+    }
     Ok(total)
 }
 
@@ -338,36 +426,79 @@ pub fn compress_slice<W: Write>(
     block_size: BlockSize,
     jobs: Jobs,
 ) -> Result<u64> {
-    let mut total = 0;
-    if jobs.is_serial() {
-        // Build the state before the first write, so an allocation
-        // fault leaves the writer empty. Each block goes to the writer
-        // when it is ready, so the output never sits in memory whole.
-        let mut state = if data.is_empty() {
-            None
-        } else {
-            Some(BlockEncoder::new(block_size)?)
-        };
-        total += write_counted(&mut writer, &StreamHeader::new(block_size).to_bytes())?;
-        if let Some(state) = state.as_mut() {
-            let width = block_size.as_usize();
-            let mut block_bytes = Vec::new();
-            for chunk in data.chunks(width) {
-                block_bytes.clear();
-                append_framed_block(state, chunk, &mut block_bytes)?;
-                total += write_counted(&mut writer, &block_bytes)?;
-            }
-        }
+    let total = if jobs.is_serial() {
+        compress_slice_serial(data, &mut writer, block_size)?
     } else {
-        let groups = run_in_pool(jobs, data.len().div_ceil(block_size.as_usize()), || {
-            encode_blocks(data, block_size)
-        })?;
-        total += write_counted(&mut writer, &StreamHeader::new(block_size).to_bytes())?;
-        for group in &groups {
-            total += write_counted(&mut writer, group)?;
+        compress_slice_parallel(data, &mut writer, block_size, jobs)?
+    };
+    writer.flush()?;
+    Ok(total)
+}
+
+/// Compress `data` block by block on the caller thread.
+///
+/// Builds the state before the first write, so an allocation fault
+/// leaves the writer empty. Each block goes to the writer when it is
+/// ready, so the output never sits in memory whole. If a block fails,
+/// the writer already holds the blocks before it.
+///
+/// # Errors
+///
+/// Returns [`Error::OutOfMemory`] when a state fails to build,
+/// [`Error::BlockTooLarge`] when a block exceeds the block size,
+/// [`Error::BwtFailed`] when a transform fails, [`Error::Io`] when an
+/// I/O call fails.
+fn compress_slice_serial<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+    block_size: BlockSize,
+) -> Result<u64> {
+    // Build the state before the first write, so an allocation
+    // fault leaves the writer empty. Each block goes to the writer
+    // when it is ready, so the output never sits in memory whole.
+    let mut state = if data.is_empty() {
+        None
+    } else {
+        Some(BlockEncoder::new(block_size)?)
+    };
+    let mut total = write_counted(&mut *writer, &StreamHeader::new(block_size).to_bytes())?;
+    if let Some(state) = state.as_mut() {
+        let width = block_size.as_usize();
+        let mut block_bytes = Vec::new();
+        for chunk in data.chunks(width) {
+            block_bytes.clear();
+            append_framed_block(state, chunk, &mut block_bytes)?;
+            total += write_counted(&mut *writer, &block_bytes)?;
         }
     }
-    writer.flush()?;
+    Ok(total)
+}
+
+/// Compress `data` on the pool that `jobs` selects.
+///
+/// Output bytes are identical to the serial path. The path writes
+/// nothing when any block fails.
+///
+/// # Errors
+///
+/// Returns [`Error::OutOfMemory`] when a state fails to build or
+/// [`Error::ThreadPoolFailed`] when the pool build fails,
+/// [`Error::BlockTooLarge`] when a block exceeds the block size,
+/// [`Error::BwtFailed`] when a transform fails, [`Error::Io`] when an
+/// I/O call fails.
+fn compress_slice_parallel<W: Write>(
+    data: &[u8],
+    writer: &mut W,
+    block_size: BlockSize,
+    jobs: Jobs,
+) -> Result<u64> {
+    let groups = run_in_pool(jobs, data.len().div_ceil(block_size.as_usize()), || {
+        encode_blocks(data, block_size)
+    })?;
+    let mut total = write_counted(&mut *writer, &StreamHeader::new(block_size).to_bytes())?;
+    for group in &groups {
+        total += write_counted(&mut *writer, group)?;
+    }
     Ok(total)
 }
 
@@ -413,26 +544,59 @@ pub fn compress_slice<W: Write>(
 /// ```
 pub fn decompress<R: Read, W: Write>(reader: R, mut writer: W, jobs: Jobs) -> Result<u64> {
     let input = read_fully(reader)?;
-    let mut total = 0;
-    if jobs.is_serial() {
-        // Decode each block after its split and write it at once. A
-        // fault leaves the blocks before it in the writer.
-        let blocks = StreamBlocks::new(&input)?;
-        let mut decoder = BlockDecoder::new(blocks.block_size())?;
-        let mut plain = Vec::new();
-        for block in blocks {
-            let block = block?;
-            plain.clear();
-            decoder.decode_block_into(block.payload, block.header.original_size, &mut plain)?;
-            total += write_counted(&mut writer, &plain)?;
-        }
+    let total = if jobs.is_serial() {
+        decompress_serial(&input, &mut writer)?
     } else {
-        let (block_size, blocks) = split_stream(&input)?;
-        let plain = run_in_pool(jobs, blocks.len(), || decode_blocks(&blocks, block_size))?;
-        total += write_counted(&mut writer, &plain)?;
-    }
+        decompress_parallel(&input, &mut writer, jobs)?
+    };
     writer.flush()?;
     Ok(total)
+}
+
+/// Decode every block of `input` on the caller thread.
+///
+/// Decodes each block after its split and writes it at once. A fault
+/// leaves the blocks before it in the writer.
+///
+/// # Errors
+///
+/// Returns [`Error::TruncatedHeader`] on a short header or trailing bytes
+/// below a full block header, [`Error::InvalidMagic`] on bad magic,
+/// [`Error::InvalidHeader`] on bad sizes,
+/// [`Error::InvalidBlockSize`] on a bad header block size,
+/// [`Error::TruncatedData`] on a short payload,
+/// [`Error::OutOfMemory`] when a state fails to build, the block
+/// error when a payload fails to decode, [`Error::Io`] when an
+/// I/O call fails.
+fn decompress_serial<W: Write>(input: &[u8], writer: &mut W) -> Result<u64> {
+    // Decode each block after its split and write it at once. A
+    // fault leaves the blocks before it in the writer.
+    let blocks = StreamBlocks::new(input)?;
+    let mut decoder = BlockDecoder::new(blocks.block_size())?;
+    let mut plain = Vec::new();
+    let mut total = 0;
+    for block in blocks {
+        let block = block?;
+        plain.clear();
+        decoder.decode_block_into(block.payload, block.header.original_size, &mut plain)?;
+        total += write_counted(&mut *writer, &plain)?;
+    }
+    Ok(total)
+}
+
+/// Decode every block of `input` on the pool that `jobs` selects.
+///
+/// Writes nothing when any block fails.
+///
+/// # Errors
+///
+/// Returns the errors of [`decompress_serial`] plus
+/// [`Error::ThreadPoolFailed`] when the pool build fails.
+#[inline]
+fn decompress_parallel<W: Write>(input: &[u8], writer: &mut W, jobs: Jobs) -> Result<u64> {
+    let (block_size, blocks) = split_stream(input)?;
+    let plain = run_in_pool(jobs, blocks.len(), || decode_blocks(&blocks, block_size))?;
+    write_counted(&mut *writer, &plain)
 }
 
 #[cfg(test)]

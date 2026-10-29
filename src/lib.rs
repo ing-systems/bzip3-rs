@@ -102,6 +102,7 @@
 // library deny would break downstream builds on newer toolchains.
 #![deny(clippy::all, clippy::pedantic)]
 #![warn(clippy::nursery)]
+#![warn(clippy::cognitive_complexity)]
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
 

@@ -219,32 +219,24 @@ impl CmCoder {
     /// Mixed split offset and mixer step for one bit context.
     ///
     /// Combines the zero-order, first-order, and mixer counters
-    /// exactly as the reference does.
+    /// exactly as the reference does. `form` is [`interpolate`] or
+    /// [`interpolate_weighted`]; both give the same point.
     #[inline]
-    fn predict(&self, context: usize, first: u8, second: u8, flag: usize) -> (u32, usize) {
+    fn predict(
+        &self,
+        context: usize,
+        first: u8,
+        second: u8,
+        flag: usize,
+        form: fn(u16, u16, u32) -> u32,
+    ) -> (u32, usize) {
         let direct = u32::from(self.c0[context]) + u32::from(self.c1[usize::from(first)][context]);
         let mixed = direct * 7 + u32::from(self.c1[usize::from(second)][context]) * 2;
         let estimate = mixed >> 4;
         let step = (estimate >> 12) as usize;
-        // All values fit in 32 bits: edges hold 0..65535, the
-        // difference spans +-65535, and the fraction spans 0..4095.
-        // The product stays below 2^29, so `i32` math matches the
-        // reference exactly with cheaper 32-bit ops.
         let row = &self.c2[2 * context + flag];
-        let low_edge = i32::from(row[step]);
-        let high_edge = i32::from(row[step + 1]);
-        let frac = {
-            // Reason: the estimate stays below 2^16,
-            // so the masked fraction always fits in `i32`.
-            #[expect(clippy::cast_possible_wrap)]
-            let frac = (estimate & 4095) as i32;
-            frac
-        };
-        let point = low_edge + (((high_edge - low_edge) * frac) >> 12);
-        // Reason: the interpolated point stays in
-        // 0..65536, so the `u32` view matches the reference exactly.
-        #[expect(clippy::cast_sign_loss)]
-        let mix = (point as u32) * 3 + estimate;
+        let point = form(row[step], row[step + 1], estimate & 4095);
+        let mix = point * 3 + estimate;
         // The mix stays below 2^18 by the counter bounds above.
         (mix, step)
     }
@@ -265,8 +257,13 @@ impl CmCoder {
         let mut context = 1_usize;
         let mut bits = byte;
         while context < 256 {
-            let (split, step) =
-                self.predict(context, cursor.prev_first, cursor.prev_second, flag);
+            let (split, step) = self.predict(
+                context,
+                cursor.prev_first,
+                cursor.prev_second,
+                flag,
+                interpolate,
+            );
             let mid = cursor.low.wrapping_add(scaled_width(cursor.low, cursor.high, split));
             let bit = bits & 128 != 0;
             // Branchless range select. Random input makes the
@@ -299,17 +296,22 @@ impl CmCoder {
         code: &mut u32,
         pos: &mut usize,
     ) -> Result<u8> {
+        let (first, second) = (cursor.prev_first, cursor.prev_second);
         let mut context = 1_usize;
-        let mut current = self.predict(1, cursor.prev_first, cursor.prev_second, flag);
+        let mut current = self.predict(1, first, second, flag, interpolate);
         while context < 256 {
             let (split, step) = current;
             // Both child contexts use counters that the current
             // bit does not change. Predict them now, so the
             // loads and the mix run while the bit resolves.
+            // The children use different but equal interpolation
+            // forms. With one form, the SLP vectorizer packs both
+            // children into vector lanes on AVX2 targets, and the
+            // lane moves slow the bit loop by up to 20%.
             let (zero, one) = if context < 128 {
                 (
-                    self.predict(2 * context, cursor.prev_first, cursor.prev_second, flag),
-                    self.predict(2 * context + 1, cursor.prev_first, cursor.prev_second, flag),
+                    self.predict(2 * context, first, second, flag, interpolate),
+                    self.predict(2 * context + 1, first, second, flag, interpolate_weighted),
                 )
             } else {
                 ((0, 0), (0, 0))
@@ -386,6 +388,41 @@ const fn scaled_width(low: u32, high: u32, mix: u32) -> u32 {
     width
 }
 
+/// Point between two mixer edges at `frac / 4096` (signed form).
+///
+/// Matches `low + ((high - low) * frac >> 12)` in the reference.
+/// `frac` is below 4096.
+#[inline]
+const fn interpolate(low: u16, high: u16, frac: u32) -> u32 {
+    // All values fit in 32 bits: edges hold 0..65535, the
+    // difference spans +-65535, and the fraction spans 0..4095.
+    // The product stays below 2^29, so `i32` math matches the
+    // reference exactly with cheaper 32-bit ops.
+    let low = low as i32;
+    let high = high as i32;
+    // Reason: the fraction is below 4096, so it always fits in `i32`.
+    #[expect(clippy::cast_possible_wrap)]
+    let frac = frac as i32;
+    let point = low + (((high - low) * frac) >> 12);
+    // Reason: the point stays in 0..65536, so the
+    // `u32` view matches the reference exactly.
+    #[expect(clippy::cast_sign_loss)]
+    let point = point as u32;
+    point
+}
+
+/// Point between two mixer edges at `frac / 4096` (weighted form).
+///
+/// Gives the same value as [`interpolate`]:
+/// `low + floor((high - low) * frac / 4096)` equals
+/// `floor((low * (4096 - frac) + high * frac) / 4096)`, because
+/// `low` is an integer. Each term stays below 2^28, so `u32` holds
+/// the sum. `frac` is below 4096.
+#[inline]
+const fn interpolate_weighted(low: u16, high: u16, frac: u32) -> u32 {
+    (low as u32 * (4096 - frac) + high as u32 * frac) >> 12
+}
+
 /// Count of leading bytes that the range endpoints already share.
 #[inline]
 const fn shared_bytes(low: u32, high: u32) -> u32 {
@@ -457,11 +494,12 @@ fn renormalize_after_bit(
 ) -> Result<()> {
     // The guard stays a branch: skewed input rarely passes it.
     if (cursor.low ^ cursor.high) < (1 << 24) {
-        if let Some(window) = input.get(*pos..*pos + 4) {
+        // `get(pos..)` then a 4-byte head avoids an overflow check on `pos + 4`.
+        if let Some(window) = input.get(*pos..).and_then(<[u8]>::first_chunk::<4>) {
             // Fast path: read four bytes, keep the shared count.
             let count = shared_bytes(cursor.low, cursor.high);
             let shift = 8 * count;
-            let next = u32::from_be_bytes([window[0], window[1], window[2], window[3]]);
+            let next = u32::from_be_bytes(*window);
             (cursor.low, cursor.high) = shift_range(cursor.low, cursor.high, shift);
             // Reason: the reference keeps only the low 32 bits.
             #[expect(clippy::cast_possible_truncation)]
@@ -511,6 +549,8 @@ fn renormalize_tail(
 #[cfg(test)]
 mod tests {
     use super::CmCoder;
+    use super::interpolate;
+    use super::interpolate_weighted;
     use crate::error::Error;
 
     /// One oracle pair: name, raw input bytes, and reference coded bytes.
@@ -657,6 +697,22 @@ mod tests {
             let got = decode_all(&padded, raw.len())
                 .unwrap_or_else(|_| panic!("padded stream decodes for {name}"));
             assert_eq!(got, raw.to_vec(), "padded decode differs for {name}");
+        }
+    }
+
+    #[test]
+    fn interpolation_forms_are_equal() {
+        const EDGES: [u16; 7] = [0, 1, 2, 4095, 4096, 65534, 65535];
+        for low in EDGES {
+            for high in EDGES {
+                for frac in 0..4096 {
+                    assert_eq!(
+                        interpolate(low, high, frac),
+                        interpolate_weighted(low, high, frac),
+                        "low {low} high {high} frac {frac}"
+                    );
+                }
+            }
         }
     }
 

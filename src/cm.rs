@@ -359,15 +359,16 @@ impl CmCoder {
 
     /// Move one counter toward one or zero as `mask` selects.
     ///
-    /// `mask` holds all ones for a one bit else all zeros. Both
-    /// directions compute, then the mask picks one. Values match
-    /// the reference `update1`/`update0` bit for bit.
+    /// `mask` holds all ones for a one bit else all zeros. Values match
+    /// the reference `update1`/`update0` bit for bit: the lowered term
+    /// is shared, and the raised term adds back the per-rate limit.
     #[inline]
     const fn adapt_counter(slot: &mut u16, rate: u32, mask: u16) {
         let value = *slot;
-        let raised = value.wrapping_add((value ^ 0xFFFF) >> rate);
-        let lowered = value.wrapping_sub(value >> rate);
-        *slot = (raised & mask) | (lowered & !mask);
+        let target = (u16::MAX >> rate) & mask;
+        *slot = value
+            .wrapping_sub(value >> rate)
+            .wrapping_add(target);
     }
 }
 

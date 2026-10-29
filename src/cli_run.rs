@@ -391,9 +391,9 @@ fn derive_output_path(path: &Path, name: &str, config: &Config) -> Option<PathBu
     match config.mode {
         Mode::Test => None,
         Mode::Encode => Some(append_suffix(path, ".bz3")),
-        Mode::Decode | Mode::Recover => {
-            Some(strip_bz3_suffix(path).unwrap_or_else(|| fallback_decode_output(path, name, config)))
-        }
+        Mode::Decode | Mode::Recover => Some(
+            strip_bz3_suffix(path).unwrap_or_else(|| fallback_decode_output(path, name, config)),
+        ),
     }
 }
 
@@ -429,12 +429,7 @@ fn run_file_special(config: &Config, input: &mut File, name: &str) -> Result<(),
         return run_stream(config, input, &mut std::io::sink(), Some(name));
     }
     check_terminal(config.mode, false, std::io::stdout().is_terminal())?;
-    run_stream(
-        config,
-        input,
-        &mut std::io::stdout().lock(),
-        Some(name),
-    )
+    run_stream(config, input, &mut std::io::stdout().lock(), Some(name))
 }
 
 /// Run one positional file into `target`.
@@ -489,7 +484,15 @@ fn run_file(config: &Config, path: &Path) -> Result<(), ExitError> {
         return run_file_special(config, &mut input, &name);
     };
     let mut output = open_output(&target, config.force)?;
-    run_file_output(config, path, &name, &mut input, &metadata, &target, &mut output)
+    run_file_output(
+        config,
+        path,
+        &name,
+        &mut input,
+        &metadata,
+        &target,
+        &mut output,
+    )
 }
 
 /// Run the standard-input to standard-output flow.

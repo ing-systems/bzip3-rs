@@ -264,7 +264,9 @@ impl CmCoder {
                 flag,
                 interpolate,
             );
-            let mid = cursor.low.wrapping_add(scaled_width(cursor.low, cursor.high, split));
+            let mid = cursor
+                .low
+                .wrapping_add(scaled_width(cursor.low, cursor.high, split));
             let bit = bits & 128 != 0;
             // Branchless range select. Random input makes the
             // bit unpredictable, so a branch mispredicts here.
@@ -316,7 +318,9 @@ impl CmCoder {
             } else {
                 ((0, 0), (0, 0))
             };
-            let mid = cursor.low.wrapping_add(scaled_width(cursor.low, cursor.high, split));
+            let mid = cursor
+                .low
+                .wrapping_add(scaled_width(cursor.low, cursor.high, split));
             let bit = *code <= mid;
             // Branchless range select. Random input makes the
             // bit unpredictable, so a branch mispredicts here.
@@ -368,9 +372,7 @@ impl CmCoder {
     const fn adapt_counter(slot: &mut u16, rate: u32, mask: u16) {
         let value = *slot;
         let target = (u16::MAX >> rate) & mask;
-        *slot = value
-            .wrapping_sub(value >> rate)
-            .wrapping_add(target);
+        *slot = value.wrapping_sub(value >> rate).wrapping_add(target);
     }
 }
 
@@ -507,14 +509,8 @@ fn renormalize_after_bit(
             *code = merged;
             *pos += count as usize;
         } else {
-            (cursor.low, cursor.high, *code, *pos) = renormalize_tail(
-                cursor.low,
-                cursor.high,
-                *code,
-                *pos,
-                input,
-                filler,
-            )?;
+            (cursor.low, cursor.high, *code, *pos) =
+                renormalize_tail(cursor.low, cursor.high, *code, *pos, input, filler)?;
         }
     }
     Ok(())
